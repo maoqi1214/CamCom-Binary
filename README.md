@@ -1,49 +1,44 @@
-# Screen-to-Camera Binary Transmission System
+# Project Goals
 
-This project implements a system for transmitting binary data from a screen to a camera using video encoding techniques.
+- Implement a framework for audio/video encoding and decoding.
+- Utilize OpenCV and FFmpeg for media handling.
+- Ensure reliability and performance through testing.
 
-## Goals
-- Develop a reliable binary transmission system using OpenCV and FFmpeg.
-- Ensure data integrity and validity through proper handling of video frames.
+# Dependency Installation
 
-## Dependencies
-### Windows
-1. Install OpenCV: [Installation Guide](https://opencv.org/releases/)
-2. Install FFmpeg: [Installation Guide](https://ffmpeg.org/download.html)
+## Windows
+- Install OpenCV: [OpenCV Installation Guide](https://docs.opencv.org/master/d3/d52/tutorial_windows_install.html)
+- Install FFmpeg: [FFmpeg Installation Guide](https://ffmpeg.org/download.html)
 
-### Linux
-1. Install OpenCV: `sudo apt install libopencv-dev`
-2. Install FFmpeg: `sudo apt install ffmpeg`
+## Linux
+- Install OpenCV: `sudo apt-get install libopencv-dev`
+- Install FFmpeg: `sudo apt-get install ffmpeg`
 
-### macOS
-1. Install OpenCV: `brew install opencv`
-2. Install FFmpeg: `brew install ffmpeg`
+## macOS
+- Install OpenCV: `brew install opencv`
+- Install FFmpeg: `brew install ffmpeg`
 
-## Build Instructions
-1. Clone the repository
-2. Create a build directory:
+# Build Using CMake
+
+1. Create a build directory:
    ```bash
-   mkdir build && cd build
+   mkdir build
+   cd build
    ```
-3. Run CMake:
+2. Run CMake:
    ```bash
    cmake ..
    ```
-4. Build the project:
+3. Compile the project:
    ```bash
    make
    ```
 
-## Usage Examples
-To encode a binary file to video:
-```bash
-./encoder <input.bin> <output.mp4> <duration_ms>
-```
+# Usage Examples
 
-To decode a video back to binary:
-```bash
-./decoder <recorded.mp4> <output.bin> <validity_mask.bin>
-```
+To encode: `./encoder <input.bin> <output.mp4> <duration_ms>`
+To decode: `./decoder <recorded.mp4> <output.bin> <validity_mask.bin>`
 
-## Validity Mask Format
-The `vout.bin` format for the validity mask will track the validity of each bit in the output binary file, helping to identify erroneous bits for correction and adjustment.
+# Validity Mask Format
+
+The file `vout.bin` contains a validity mask indicating the validity of each frame. Each byte represents a frame's validity, where `0x00` = invalid and `0x01` = valid.
