@@ -1,45 +1,48 @@
-# Screen-to-Camera Binary Transmission System
+# C++17 Project
 
-## Goals
-The goal of this project is to implement a binary transmission system that transmits binary data from a screen to a camera. This project will explore the following areas:
-- **Physical Layer**: Develop understanding of how binary data is transmitted over physical mediums.
-- **Nyquist/Shannon Theorem**: Analyze the limits of data transmission and optimize our system accordingly.
+This project implements an encoder and decoder based on the Nyquist-Shannon sampling theorem. It includes functionality for encoding audio data into video format and decoding it back.
 
-## Dependency Installation
+## Nyquist/Shannon Sampling Theorem
+
+The Nyquist-Shannon theorem establishes the minimum sampling rate required to accurately reconstruct a signal from its samples.
+
+## Installation
 
 ### Windows
-1. Install [CMake](https://cmake.org/download/).
-2. Install [OpenCV](https://opencv.org/releases/) and [FFmpeg](https://ffmpeg.org/download.html).
+- Install necessary dependencies through [Vcpkg](https://github.com/microsoft/vcpkg).
 
 ### Linux
-```bash
-sudo apt-get install cmake libopencv-dev libavcodec-dev libavformat-dev libavutil-dev
+- Use package manager to install dependencies:
+```
+sudo apt install <dependencies>
 ```
 
 ### macOS
-```bash
-brew install cmake opencv ffmpeg
+- Install dependencies using Homebrew:
+```
+brew install <dependencies>
 ```
 
-## CMake Build Steps
-1. Navigate to the project root.
-2. Run `mkdir build && cd build`.
-3. Run `cmake ..`.
-4. Run `make`.
+## Build
+
+To build the project, use CMake:
+```
+mkdir build
+cd build
+cmake ..
+make
+```
 
 ## Usage Examples
-To encode binary data:
-```bash
+- To encode:
+```
 ./encoder <input.bin> <output.mp4> <duration_ms>
 ```
 
-To decode binary data:
-```bash
+- To decode:
+```
 ./decoder <recorded.mp4> <output.bin> <validity_mask.bin>
 ```
 
-## Validity Mask Definition
-The validity mask is defined as one byte per decoded bit:
-- `0x01`: Valid bit
-- `0x00`: Invalid bit
-- MSB-first bit ordering.
+## Validity Mask Format
+The validity mask is a binary file indicating the validity of each bit in the output.
