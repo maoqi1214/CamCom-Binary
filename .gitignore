@@ -39,3 +39,33 @@
 
 # debug information files
 *.dwo
+
+# Build output directory
+/build/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+install_manifest.txt
+CTestTestfile.cmake
+
+# IDE / Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Large binary test files (keep only small sample files in /tests)
+tests/*.mp4
+tests/*.avi
+tests/*.mkv
+tests/recorded_*.bin
+
+# Generated output binaries from running the tools (keep only the test sample)
+tests/test_*.bin
+tests/recorded_*.bin
