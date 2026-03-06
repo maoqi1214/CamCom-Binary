@@ -1,6 +1,6 @@
 # Build outputs
-build/
-out/
+/build/
+/out/
 *.o
 *.obj
 *.a
@@ -32,13 +32,14 @@ Thumbs.db
 # Logs
 *.log
 
-# Large/binary test artifacts (keep only small samples under tests/)
+# Large video/media artifacts — ignore everywhere except committed test assets
 *.mp4
 *.avi
 *.mkv
 *.mov
 
-# Optional: ignore big binary blobs; keep small ones committed if needed
-*.bin
-!tests/*.bin
-!tests/README.md
+# Ignore binary output blobs in output directories; keep small test fixtures
+/output/
+output/*.bin
+# Do NOT ignore tests/sample_input.bin (it is a committed test fixture)
+!tests/sample_input.bin
