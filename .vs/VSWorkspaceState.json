@@ -9,8 +9,10 @@
   },
   "ExpandedNodes": [
     "",
+    "\\out",
+    "\\src",
     "\\tests"
   ],
-  "SelectedNode": "\\.gitignore",
+  "SelectedNode": "\\out\\build",
   "PreviewInSolutionExplorer": false
 }
