@@ -1,0 +1,67 @@
+﻿#include "common.hpp"
+#include "io.hpp"
+
+#include <cstdlib>
+#include <iostream>
+#include <string>
+
+// ---------------------------------------------------------------------------
+// Usage
+// ---------------------------------------------------------------------------
+
+static void print_usage(const char* argv0) {
+    std::cerr
+        << "Usage: " << argv0 << " <input.bin> <output.mp4> <duration_ms>\n"
+        << "\n"
+        << "  input.bin    Path to the binary file to encode.\n"
+        << "  output.mp4   Path to the output video file.\n"
+        << "  duration_ms  Total video duration in milliseconds.\n"
+        << "\n"
+        << "Example:\n"
+        << "  " << argv0 << " payload.bin out.mp4 5000\n";
+}
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+
+int main(int argc, char* argv[]) {
+    if (argc != 4) {
+        print_usage(argv[0]);
+        return static_cast<int>(camcom::ExitCode::BadArgs);
+    }
+
+    const std::string input_path   = argv[1];
+    const std::string output_path  = argv[2];
+    const long        duration_ms  = std::stol(argv[3]);
+
+    if (duration_ms <= 0) {
+        std::cerr << "Error: duration_ms must be a positive integer.\n";
+        print_usage(argv[0]);
+        return static_cast<int>(camcom::ExitCode::BadArgs);
+    }
+
+    // Verify the input file is readable.
+    if (!camcom::file_exists(input_path)) {
+        std::cerr << "Error: input file not found: " << input_path << "\n";
+        return static_cast<int>(camcom::ExitCode::IoError);
+    }
+
+    std::cout << "[encoder] Input : " << input_path  << "\n"
+              << "[encoder] Output: " << output_path << "\n"
+              << "[encoder] Duration (ms): " << duration_ms << "\n";
+
+    // TODO: Read input binary file.
+    // const auto data = camcom::read_binary_file(input_path);
+
+    // TODO: Build StreamHeader from data size and encoding parameters.
+
+    // TODO: Split data into per-frame payloads.
+
+    // TODO: For each frame, render visual data cells onto an OpenCV Mat.
+
+    // TODO: Encode rendered frames into the output video using FFmpeg.
+
+    std::cout << "[encoder] TODO: encoding not yet implemented.\n";
+    return static_cast<int>(camcom::ExitCode::Ok);
+}

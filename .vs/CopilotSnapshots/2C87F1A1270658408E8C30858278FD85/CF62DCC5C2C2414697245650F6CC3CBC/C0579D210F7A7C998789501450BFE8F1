@@ -1,0 +1,83 @@
+﻿cmake_minimum_required(VERSION 3.16)
+
+project(CamComBinary
+  VERSION 0.1.0
+  DESCRIPTION "Screen-to-Camera Binary Transmission System"
+  LANGUAGES CXX
+)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Helpful warnings (optional)
+if(MSVC)
+  add_compile_options(/W4)
+else()
+  add_compile_options(-Wall -Wextra -Wpedantic)
+endif()
+# ---- OpenCV ----
+find_package(OpenCV REQUIRED)
+
+# Try to find FFmpeg libraries via pkg-config. If not available, allow user to set include/libs via CMake cache.
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+  pkg_check_modules(AVCODEC REQUIRED libavcodec)
+  pkg_check_modules(AVFORMAT REQUIRED libavformat)
+  pkg_check_modules(AVUTIL REQUIRED libavutil)
+else()
+  message(WARNING "PkgConfig not found. You may need to set FFmpeg include/library paths manually via -D options.")
+  # Allow users to provide these paths/names on the command line or cache
+  set(AVCODEC_INCLUDE_DIRS "" CACHE PATH "FFmpeg libavcodec include dir")
+  set(AVFORMAT_INCLUDE_DIRS "" CACHE PATH "FFmpeg libavformat include dir")
+  set(AVUTIL_INCLUDE_DIRS "" CACHE PATH "FFmpeg libavutil include dir")
+
+  set(AVCODEC_LIBRARIES avcodec CACHE STRING "FFmpeg libavcodec library")
+  set(AVFORMAT_LIBRARIES avformat CACHE STRING "FFmpeg libavformat library")
+  set(AVUTIL_LIBRARIES avutil CACHE STRING "FFmpeg libavutil library")
+endif()
+
+# Normalize OpenCV variables (some CMake/FindOpenCV variants provide OpenCV_LIBS vs OpenCV_LIBRARIES)
+if(NOT DEFINED OpenCV_LIBS OR OpenCV_LIBS STREQUAL "")
+  if(DEFINED OpenCV_LIBRARIES)
+    set(OpenCV_LIBS ${OpenCV_LIBRARIES})
+  endif()
+endif()
+
+# Aggregate FFmpeg include dirs and library names
+set(FFMPEG_INCLUDE_DIRS "${AVCODEC_INCLUDE_DIRS};${AVFORMAT_INCLUDE_DIRS};${AVUTIL_INCLUDE_DIRS}")
+set(FFMPEG_LIBRARIES "${AVCODEC_LIBRARIES};${AVFORMAT_LIBRARIES};${AVUTIL_LIBRARIES}")
+
+# Core library
+add_library(camcom_core
+  src/common.cpp
+  src/io.cpp
+)
+
+target_include_directories(camcom_core
+  PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${OpenCV_INCLUDE_DIRS}
+    ${FFMPEG_INCLUDE_DIRS}
+)
+
+target_link_libraries(camcom_core
+  PUBLIC
+    ${OpenCV_LIBS}
+    ${FFMPEG_LIBRARIES}
+)
+
+# Optionally build example binaries
+option(BUILD_EXAMPLES "Build encoder/decoder example binaries" ON)
+if(BUILD_EXAMPLES)
+  add_executable(encoder src/encoder.cpp)
+  target_link_libraries(encoder PRIVATE camcom_core)
+
+  add_executable(decoder src/decoder.cpp)
+  target_link_libraries(decoder PRIVATE camcom_core)
+
+  # Place example binaries in build/bin
+  set_target_properties(encoder decoder PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+endif()

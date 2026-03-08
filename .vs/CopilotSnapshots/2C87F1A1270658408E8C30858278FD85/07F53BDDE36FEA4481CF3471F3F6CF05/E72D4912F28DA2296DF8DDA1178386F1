@@ -1,0 +1,32 @@
+﻿{
+    "configurations": [
+        {
+            "name": "x64-Debug",
+            "generator": "Ninja",
+            "configurationType": "Debug",
+            "inheritEnvironments": [ "msvc_x64_x64" ],
+            "buildRoot": "${projectDir}\\out\\build\\${name}",
+            "installRoot": "${projectDir}\\out\\install\\${name}",
+            "cmakeCommandArgs": "",
+            "buildCommandArgs": "",
+            "ctestCommandArgs": "",
+            "variables": [
+                {
+                    "name": "AVCODEC_LIBRARIES",
+                    "value": "D:\\vscode\\light\\ffmpeg-master-latest-win64-gpl-shared\\ffmpeg-master-latest-win64-gpl-shared\\lib\\avcodec.lib",
+                    "type": "STRING"
+                },
+                {
+                    "name": "AVFORMAT_LIBRARIES",
+                    "value": "D:\\vscode\\light\\ffmpeg-master-latest-win64-gpl-shared\\ffmpeg-master-latest-win64-gpl-shared\\lib\\avformat.lib",
+                    "type": "STRING"
+                },
+                {
+                    "name": "AVUTIL_LIBRARIES",
+                    "value": "D:\\vscode\\light\\ffmpeg-master-latest-win64-gpl-shared\\ffmpeg-master-latest-win64-gpl-shared\\lib\\avutil.lib",
+                    "type": "STRING"
+                }
+            ]
+        }
+    ]
+}
