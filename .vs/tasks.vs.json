@@ -1,0 +1,14 @@
+{
+    "version": "0.2.1",
+    "defaults": {},
+    "configurations": [
+        {
+            "type": "default",
+            "project": "CMakeLists.txt",
+            "projectTarget": "decoder.exe (bin/decoder.exe)",
+            "name": "decoder",
+            "args": [ "output.mp4", "recovered.bin" ],
+            "workingDirectory": "${workspaceRoot}/out/build/x64-Release/bin"
+        }
+    ]
+}

@@ -10,8 +10,10 @@
 #include <string>
 #include <vector>
 #include <cmath>
+#include <filesystem>
 
 using namespace camcom;
+namespace fs = std::filesystem;
 
 static void print_usage(const char* argv0) {
     std::cerr
@@ -33,7 +35,7 @@ static void serialize_u32(std::vector<uint8_t>& buf, uint32_t v) {
     buf.push_back(static_cast<uint8_t>((v >> 24) & 0xFFu));
 }
 static void serialize_u64(std::vector<uint8_t>& buf, uint64_t v) {
-    for (int i = 0; i < 8; ++i) buf.push_back(static_cast<uint8_t>((v >> (8*i)) & 0xFFu));
+    for (int i = 0; i < 8; ++i) buf.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFFu));
 }
 
 int main(int argc, char* argv[]) {
@@ -42,8 +44,8 @@ int main(int argc, char* argv[]) {
         return static_cast<int>(ExitCode::BadArgs);
     }
 
-    const std::string input_path   = argv[1];
-    const std::string output_path  = argv[2];
+    const std::string input_path = argv[1];
+    const std::string output_path = argv[2];
     const int fps = std::stoi(argv[3]);
 
     if (fps <= 0 || fps > 60) {
@@ -56,9 +58,9 @@ int main(int argc, char* argv[]) {
         return static_cast<int>(ExitCode::IoError);
     }
 
-    std::cout << "[encoder] Input : " << input_path  << "\n"
-              << "[encoder] Output: " << output_path << "\n"
-              << "[encoder] FPS   : " << fps << "\n";
+    std::cout << "[encoder] Input : " << input_path << "\n"
+        << "[encoder] Output: " << output_path << "\n"
+        << "[encoder] FPS   : " << fps << "\n";
 
     const auto data = read_binary_file(input_path);
 
@@ -71,7 +73,15 @@ int main(int argc, char* argv[]) {
     std::cout << "[encoder] total bytes=" << data.size() << " frames=" << total_frames << "\n";
 
     cv::Mat first_img;
-    cv::VideoWriter writer;
+
+    // Create temporary directory for frames
+    const std::string temp_dir = "temp_frames";
+    if (fs::exists(temp_dir)) {
+        fs::remove_all(temp_dir);
+    }
+    fs::create_directory(temp_dir);
+
+    size_t frame_count = 0;
 
     // Write a small bootstrap frame (unprotected) that carries parameters needed to decode
     std::vector<uint8_t> bootstrap_buf;
@@ -93,19 +103,15 @@ int main(int argc, char* argv[]) {
     serialize_u32(bootstrap_buf, static_cast<uint32_t>(cfg.reference_block_size));
 
     render_frame(first_img, bootstrap_buf, cfg);
-    const int fourcc = cv::VideoWriter::fourcc('m','p','4','v');
-    writer.open(output_path, fourcc, cfg.fps, first_img.size());
-    if (!writer.isOpened()) {
-        std::cerr << "Error: failed to open VideoWriter for " << output_path << "\n";
-        return static_cast<int>(ExitCode::EncodingError);
-    }
+    cv::Mat black0 = first_img.clone(); black0.setTo(cv::Scalar(0, 0, 0));
 
     // Repeat bootstrap frame a few times to improve robustness
     const int BOOTSTRAP_REPEAT = 3;
-    cv::Mat black0 = first_img.clone(); black0.setTo(cv::Scalar(0,0,0));
     for (int i = 0; i < BOOTSTRAP_REPEAT; ++i) {
-        writer.write(first_img);
-        writer.write(black0);
+        const std::string frame_path = temp_dir + "/frame_" + std::to_string(frame_count++) + ".png";
+        cv::imwrite(frame_path, first_img);
+        const std::string black_path = temp_dir + "/frame_" + std::to_string(frame_count++) + ".png";
+        cv::imwrite(black_path, black0);
     }
 
     // Now write the StreamHeader protected by RS parity
@@ -138,8 +144,10 @@ int main(int argc, char* argv[]) {
     // Repeat RS-protected StreamHeader several times to ensure decoder captures it
     const int STREAMHDR_REPEAT = 3;
     for (int i = 0; i < STREAMHDR_REPEAT; ++i) {
-        writer.write(first_img);
-        writer.write(black0);
+        const std::string frame_path = temp_dir + "/frame_" + std::to_string(frame_count++) + ".png";
+        cv::imwrite(frame_path, first_img);
+        const std::string black_path = temp_dir + "/frame_" + std::to_string(frame_count++) + ".png";
+        cv::imwrite(black_path, black0);
     }
 
     for (uint32_t fi = 0; fi < total_frames; ++fi) {
@@ -180,15 +188,29 @@ int main(int argc, char* argv[]) {
 
         // Render frame image
         render_frame(first_img, frame_buf, cfg);
-        writer.write(first_img);
+        const std::string frame_path = temp_dir + "/frame_" + std::to_string(frame_count++) + ".png";
+        cv::imwrite(frame_path, first_img);
 
         // insert a black transition frame to reduce motion blur artifacts
         cv::Mat black = first_img.clone();
-        black.setTo(cv::Scalar(0,0,0));
-        writer.write(black);
+        black.setTo(cv::Scalar(0, 0, 0));
+        const std::string black_path = temp_dir + "/frame_" + std::to_string(frame_count++) + ".png";
+        cv::imwrite(black_path, black);
     }
 
-    writer.release();
+    // Use ffmpeg to create video from frames
+    std::string ffmpeg_cmd = "ffmpeg -y -framerate " + std::to_string(fps) + " -i " + temp_dir + "/frame_%d.png -c:v libx264 -pix_fmt yuv420p " + output_path;
+    std::cout << "[encoder] Running ffmpeg command: " << ffmpeg_cmd << "\n";
+    int ffmpeg_result = system(ffmpeg_cmd.c_str());
+    if (ffmpeg_result != 0) {
+        std::cerr << "Error: ffmpeg command failed with exit code " << ffmpeg_result << "\n";
+        // Clean up temporary files
+        fs::remove_all(temp_dir);
+        return static_cast<int>(ExitCode::EncodingError);
+    }
+
+    // Clean up temporary files
+    fs::remove_all(temp_dir);
 
     std::cout << "[encoder] Done.\n";
     return static_cast<int>(ExitCode::Ok);

@@ -9,10 +9,12 @@
   },
   "ExpandedNodes": [
     "",
-    "\\out",
+    "\\build",
+    "\\docs",
+    "\\include",
     "\\src",
     "\\tests"
   ],
-  "SelectedNode": "\\out\\build",
+  "SelectedNode": "\\CMakeLists.txt",
   "PreviewInSolutionExplorer": false
 }
