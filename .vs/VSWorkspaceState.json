@@ -15,6 +15,6 @@
     "\\src",
     "\\tests"
   ],
-  "SelectedNode": "\\CMakeLists.txt",
+  "SelectedNode": "\\src\\encoder.cpp",
   "PreviewInSolutionExplorer": false
 }
