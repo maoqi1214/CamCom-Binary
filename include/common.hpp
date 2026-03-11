@@ -22,6 +22,18 @@ constexpr int DEFAULT_FPS = 30;
 /// Size of the QR / data-matrix cell in pixels (width == height).
 constexpr int DEFAULT_CELL_SIZE = 20;
 
+/// Default output video frame width in pixels.
+constexpr int DEFAULT_FRAME_WIDTH = 640;
+
+/// Default output video frame height in pixels.
+constexpr int DEFAULT_FRAME_HEIGHT = 480;
+
+/// Serialised size of StreamHeader on the wire (bytes).
+constexpr std::size_t STREAM_HEADER_SIZE = 22; // 4+1+8+1+4+4
+
+/// Serialised size of FrameHeader on the wire (bytes).
+constexpr std::size_t FRAME_HEADER_SIZE = 21; // 4+1+4+4+4+4
+
 // ---------------------------------------------------------------------------
 // Shared types and enums
 // ---------------------------------------------------------------------------
@@ -64,5 +76,23 @@ struct StreamHeader {
     uint32_t fps;             ///< Frames per second of the output video.
     uint32_t cell_size;       ///< Visual cell size in pixels.
 };
+
+// ---------------------------------------------------------------------------
+// Serialisation helpers
+// ---------------------------------------------------------------------------
+
+/// Serialise a StreamHeader into exactly STREAM_HEADER_SIZE bytes (little-endian).
+std::vector<uint8_t> serialize_stream_header(const StreamHeader& hdr);
+
+/// Deserialise a StreamHeader from a byte buffer.
+/// Returns false if the buffer is too small.
+bool deserialize_stream_header(const uint8_t* data, std::size_t len, StreamHeader& out);
+
+/// Serialise a FrameHeader into exactly FRAME_HEADER_SIZE bytes (little-endian).
+std::vector<uint8_t> serialize_frame_header(const FrameHeader& hdr);
+
+/// Deserialise a FrameHeader from a byte buffer.
+/// Returns false if the buffer is too small.
+bool deserialize_frame_header(const uint8_t* data, std::size_t len, FrameHeader& out);
 
 } // namespace camcom
