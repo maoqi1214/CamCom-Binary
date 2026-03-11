@@ -22,7 +22,7 @@ find_package(OpenCV REQUIRED)
 
 # ---- FFmpeg (libavcodec, libavformat, libavutil) ----
 # Prefer pkg-config when available (Linux/macOS). On Windows, user may need to set paths manually.
-find_package(PkgConfig QUIET)
+#     find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
   pkg_check_modules(AVCODEC REQUIRED libavcodec)
   pkg_check_modules(AVFORMAT REQUIRED libavformat)

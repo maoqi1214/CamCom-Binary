@@ -1,0 +1,43 @@
+﻿#pragma once
+
+#include <opencv2/opencv.hpp>
+#include "common.hpp"
+
+#include <cstdint>
+#include <vector>
+#include <array>
+
+namespace camcom {
+
+struct EncoderConfig {
+    int cell_size = DEFAULT_CELL_SIZE; // pixels per cell
+    int fps = 10; // conservative default to avoid rolling shutter
+    int payload_bytes_per_frame = 256; // user-configurable
+    int cells_per_row = 32; // number of data cells per row
+    int rs_nsym = 16; // Reed-Solomon parity bytes
+    int reference_block_size = 2; // reference block size in cells (square)
+    // colors in BGR (OpenCV uses BGR)
+    cv::Scalar colors[4] = {
+        cv::Scalar(0,0,0),      // 00 -> black
+        cv::Scalar(255,0,0),    // 01 -> blue
+        cv::Scalar(0,255,0),    // 10 -> green
+        cv::Scalar(0,0,255)     // 11 -> red
+    };
+};
+
+// Render a single frame (data cells) into an image. The image will include
+// corner finder markers and the data region.
+void render_frame(cv::Mat& out, const std::vector<uint8_t>& payload, const EncoderConfig& cfg);
+
+// Given a captured/wrapped frame (warped to frontal view), sample the grid and
+// recover the payload bytes. Returns true on success.
+bool sample_frame(const cv::Mat& warped, std::vector<uint8_t>& out_payload, const EncoderConfig& cfg);
+
+// Return Laplacian variance (measure of sharpness). Lower values -> blurrier.
+double laplacian_variance(const cv::Mat& img);
+
+// Apply simple color calibration: given observed reference colors and expected colors,
+// produce a per-channel scale vector to adjust sampled means before matching.
+cv::Vec3d compute_color_scale(const std::array<cv::Scalar,4>& expected, const std::array<cv::Scalar,4>& observed);
+
+} // namespace camcom

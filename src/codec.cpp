@@ -90,69 +90,184 @@ namespace camcom {
         }
     }
 
-    bool sample_frame(const cv::Mat& warped, std::vector<uint8_t>& out_payload, const EncoderConfig& cfg) {
-        // Expect warped image that tightly contains data region including markers.
-        // We will infer marker size in pixels by locating the black/white finder at corners.
-        // For simplicity assume markers are present and data region starts after marker_px.
+    static bool warp_with_finders(const cv::Mat& src, cv::Mat& warped) {
+        cv::Mat gray;
+        if (src.channels() == 3) cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
+        else gray = src;
+        cv::GaussianBlur(gray, gray, cv::Size(5, 5), 0);
+        cv::Mat bin;
+        cv::threshold(gray, bin, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
 
-        // Try to infer marker_px by searching from corners for large black square.
-        const int img_w = warped.cols;
-        const int img_h = warped.rows;
+        std::vector<std::vector<cv::Point>> contours;
+        cv::findContours(bin, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
-        // estimate marker size as 4 * cell_size
-        const int marker_px = 4 * cfg.cell_size;
-        const int origin_x = marker_px;
-        const int origin_y = marker_px;
-
-        const int data_w = img_w - marker_px * 2;
-        const int data_h = img_h - marker_px * 2;
-
-        if (data_w <= 0 || data_h <= 0) return false;
-
-        const int cells_per_row = cfg.cells_per_row;
-        const int cols = cells_per_row;
-        const int rows = data_h / cfg.cell_size;
-
-        if (rows <= 0) return false;
-
-        std::vector<int> cells;
-        cells.reserve(rows * cols);
-
-        for (int r = 0; r < rows; ++r) {
-            for (int c = 0; c < cols; ++c) {
-                int x = origin_x + c * cfg.cell_size;
-                int y = origin_y + r * cfg.cell_size;
-                cv::Rect cell_rect(x, y, cfg.cell_size, cfg.cell_size);
-                cv::Mat roi = warped(cell_rect);
-                cv::Scalar mean = cv::mean(roi);
-                // find nearest color
-                int best = 0;
-                int bestd = color_distance_sq(mean, cfg.colors[0]);
-                for (int k = 1; k < 4; ++k) {
-                    int d = color_distance_sq(mean, cfg.colors[k]);
-                    if (d < bestd) { best = k; bestd = d; }
-                }
-                cells.push_back(best);
-            }
+        struct Candidate { double area; std::vector<cv::Point> poly; cv::Point2f center; };
+        std::vector<Candidate> candidates;
+        for (const auto& c : contours) {
+            double area = cv::contourArea(c);
+            if (area < 100.0) continue;
+            std::vector<cv::Point> poly;
+            cv::approxPolyDP(c, poly, 0.05 * cv::arcLength(c, true), true);
+            if (poly.size() < 4) continue;
+            cv::Rect bounds = cv::boundingRect(poly);
+            double aspect = static_cast<double>(bounds.width) / std::max(1, bounds.height);
+            if (aspect < 0.7 || aspect > 1.3) continue;
+            cv::Moments m = cv::moments(poly);
+            cv::Point2f center(static_cast<float>(m.m10 / m.m00), static_cast<float>(m.m01 / m.m00));
+            candidates.push_back({ area, poly, center });
         }
 
-        // pack cells into bytes (4 cells per byte, MSB-first)
-        const int total_cells = static_cast<int>(cells.size());
-        const int total_bytes = (total_cells / 4);
-        out_payload.clear();
-        out_payload.reserve(total_bytes);
-        for (int i = 0; i < total_bytes; ++i) {
-            uint8_t b = 0;
-            for (int j = 0; j < 4; ++j) {
-                int cell_idx = i * 4 + j;
-                int v = cells[cell_idx] & 0x3;
-                int shift = 6 - 2 * j;
-                b |= static_cast<uint8_t>(v << shift);
-            }
-            out_payload.push_back(b);
-        }
+        if (candidates.size() < 4) return false;
+        std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) { return a.area > b.area; });
+        candidates.resize(4);
 
+        std::vector<cv::Point2f> pts;
+        pts.reserve(4);
+        for (const auto& c : candidates) pts.push_back(c.center);
+
+        // order: top-left, top-right, bottom-left, bottom-right
+        std::sort(pts.begin(), pts.end(), [](const cv::Point2f& a, const cv::Point2f& b) { return a.y == b.y ? a.x < b.x : a.y < b.y; });
+        cv::Point2f tl = pts[0], tr = pts[1], bl = pts[2], br = pts[3];
+        if (tr.x < tl.x) std::swap(tr, tl);
+        if (br.x < bl.x) std::swap(br, bl);
+
+        double w1 = cv::norm(tr - tl);
+        double w2 = cv::norm(br - bl);
+        double h1 = cv::norm(bl - tl);
+        double h2 = cv::norm(br - tr);
+        double target = std::max({ w1, w2, h1, h2 });
+        if (target < 1.0) return false;
+        int dst_size = static_cast<int>(std::ceil(target));
+
+        std::vector<cv::Point2f> dst = {
+            cv::Point2f(0.f, 0.f),
+            cv::Point2f(static_cast<float>(dst_size - 1), 0.f),
+            cv::Point2f(0.f, static_cast<float>(dst_size - 1)),
+            cv::Point2f(static_cast<float>(dst_size - 1), static_cast<float>(dst_size - 1))
+        };
+
+        cv::Mat M = cv::getPerspectiveTransform(std::vector<cv::Point2f>{ tl, tr, bl, br }, dst);
+        cv::warpPerspective(src, warped, M, cv::Size(dst_size, dst_size));
         return true;
+    }
+
+    static cv::Mat center_crop_square(const cv::Mat& src) {
+        int side = std::min(src.cols, src.rows);
+        int x = (src.cols - side) / 2;
+        int y = (src.rows - side) / 2;
+        cv::Rect roi(x, y, side, side);
+        return src(roi).clone();
+    }
+
+    bool sample_frame(const cv::Mat& frame, std::vector<uint8_t>& out_payload, const EncoderConfig& cfg) {
+        auto sample_aligned = [&](const cv::Mat& aligned, const char* label) -> bool {
+            const int img_w = aligned.cols;
+            const int img_h = aligned.rows;
+
+            // Estimate data bounding band by variance along rows/cols to better align when margins differ.
+            cv::Mat gray;
+            if (aligned.channels() == 3) cv::cvtColor(aligned, gray, cv::COLOR_BGR2GRAY); else gray = aligned;
+
+            std::vector<double> row_std(img_h), col_std(img_w);
+            for (int y = 0; y < img_h; ++y) {
+                cv::Scalar mean, stddev;
+                cv::meanStdDev(gray.row(y), mean, stddev);
+                row_std[y] = stddev[0];
+            }
+            for (int x = 0; x < img_w; ++x) {
+                cv::Scalar mean, stddev;
+                cv::meanStdDev(gray.col(x), mean, stddev);
+                col_std[x] = stddev[0];
+            }
+
+            auto find_band = [](const std::vector<double>& v, double thresh_frac) {
+                double maxv = 0; for (double d : v) maxv = std::max(maxv, d);
+                double th = maxv * thresh_frac;
+                int lo = -1, hi = -1;
+                for (int i = 0; i < static_cast<int>(v.size()); ++i) {
+                    if (v[i] >= th) { if (lo == -1) lo = i; hi = i; }
+                }
+                return std::pair<int,int>(lo, hi);
+            };
+
+            auto [row_lo, row_hi] = find_band(row_std, 0.3);
+            auto [col_lo, col_hi] = find_band(col_std, 0.3);
+
+            if (row_lo == -1 || col_lo == -1) {
+                std::cout << "[decoder] sample_frame(" << label << ") no variance band found" << "\n";
+                return false;
+            }
+
+            int origin_x = std::max(0, col_lo - (col_lo % cfg.cell_size));
+            int origin_y = std::max(0, row_lo - (row_lo % cfg.cell_size));
+
+            // ensure we have room for full row/col count
+            const int cols = cfg.cells_per_row;
+            const int data_w = cols * cfg.cell_size;
+            if (origin_x + data_w > img_w) origin_x = std::max(0, img_w - data_w);
+
+            int observed_h = row_hi - origin_y + 1;
+            int rows = observed_h / cfg.cell_size;
+            if (rows <= 0) {
+                std::cout << "[decoder] sample_frame(" << label << ") rows <= 0" << "\n";
+                return false;
+            }
+
+            std::vector<int> cells;
+            cells.reserve(rows * cols);
+
+            for (int r = 0; r < rows; ++r) {
+                for (int c = 0; c < cols; ++c) {
+                    int x = origin_x + c * cfg.cell_size;
+                    int y = origin_y + r * cfg.cell_size;
+                    if (x + cfg.cell_size > aligned.cols || y + cfg.cell_size > aligned.rows) {
+                        std::cout << "[decoder] sample_frame(" << label << ") cell out of bounds at r=" << r << " c=" << c << "\n";
+                        return false;
+                    }
+                    cv::Rect cell_rect(x, y, cfg.cell_size, cfg.cell_size);
+                    cv::Mat roi = aligned(cell_rect);
+                    cv::Scalar mean = cv::mean(roi);
+                    int best = 0;
+                    int bestd = color_distance_sq(mean, cfg.colors[0]);
+                    for (int k = 1; k < 4; ++k) {
+                        int d = color_distance_sq(mean, cfg.colors[k]);
+                        if (d < bestd) { best = k; bestd = d; }
+                    }
+                    cells.push_back(best);
+                }
+            }
+
+            const int total_cells = static_cast<int>(cells.size());
+            const int total_bytes = (total_cells / 4);
+            out_payload.clear();
+            out_payload.reserve(total_bytes);
+            for (int i = 0; i < total_bytes; ++i) {
+                uint8_t b = 0;
+                for (int j = 0; j < 4; ++j) {
+                    int cell_idx = i * 4 + j;
+                    int v = cells[cell_idx] & 0x3;
+                    int shift = 6 - 2 * j;
+                    b |= static_cast<uint8_t>(v << shift);
+                }
+                out_payload.push_back(b);
+            }
+            return true;
+        };
+
+        cv::Mat warped;
+        if (warp_with_finders(frame, warped)) {
+            if (sample_aligned(warped, "warped")) return true;
+            std::cout << "[decoder] sample_frame: warped sampling failed, trying raw" << "\n";
+        } else {
+            std::cout << "[decoder] warp_with_finders failed, trying raw" << "\n";
+        }
+
+        // fallback 1: center-crop square then sample
+        cv::Mat cropped = center_crop_square(frame);
+        if (sample_aligned(cropped, "cropped")) return true;
+
+        // fallback 2: assume input already aligned
+        return sample_aligned(frame, "raw");
     }
 
     double laplacian_variance(const cv::Mat& img) {

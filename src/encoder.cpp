@@ -38,6 +38,67 @@ static void serialize_u64(std::vector<uint8_t>& buf, uint64_t v) {
     for (int i = 0; i < 8; ++i) buf.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFFu));
 }
 
+static std::vector<uint8_t> build_bootstrap(const EncoderConfig& cfg) {
+    std::vector<uint8_t> buf;
+    serialize_u32(buf, MAGIC);
+    serialize_u8(buf, FORMAT_VERSION);
+    serialize_u32(buf, static_cast<uint32_t>(cfg.rs_nsym));
+    serialize_u32(buf, static_cast<uint32_t>(cfg.cell_size));
+    serialize_u32(buf, static_cast<uint32_t>(cfg.cells_per_row));
+    serialize_u32(buf, static_cast<uint32_t>(cfg.payload_bytes_per_frame));
+    serialize_u32(buf, static_cast<uint32_t>(cfg.fps));
+    serialize_u32(buf, static_cast<uint32_t>(cfg.reference_block_size));
+    return buf;
+}
+
+static std::vector<uint8_t> build_stream_header(const EncoderConfig& cfg, size_t total_bytes, uint32_t total_frames) {
+    std::vector<uint8_t> buf;
+    serialize_u32(buf, MAGIC);
+    serialize_u8(buf, FORMAT_VERSION);
+    serialize_u64(buf, static_cast<uint64_t>(total_bytes));
+    serialize_u8(buf, static_cast<uint8_t>(Encoding::Binary));
+    serialize_u32(buf, static_cast<uint32_t>(cfg.fps));
+    serialize_u32(buf, static_cast<uint32_t>(cfg.cell_size));
+    serialize_u32(buf, static_cast<uint32_t>(cfg.rs_nsym));
+    serialize_u32(buf, static_cast<uint32_t>(cfg.payload_bytes_per_frame));
+    serialize_u32(buf, static_cast<uint32_t>(cfg.cells_per_row));
+    serialize_u32(buf, total_frames);
+
+    std::vector<uint8_t> parity = rs::encode(buf, cfg.rs_nsym);
+    buf.insert(buf.end(), parity.begin(), parity.end());
+    return buf;
+}
+
+static std::vector<uint8_t> build_frame_codeword(uint32_t fi, uint32_t total_frames, const std::vector<uint8_t>& data, size_t offset, size_t chunk, const EncoderConfig& cfg) {
+    std::vector<uint8_t> frame_buf;
+    serialize_u32(frame_buf, MAGIC);
+    frame_buf.push_back(FORMAT_VERSION);
+    serialize_u32(frame_buf, fi);
+    serialize_u32(frame_buf, total_frames);
+    serialize_u32(frame_buf, static_cast<uint32_t>(chunk));
+    const size_t checksum_pos = frame_buf.size();
+    serialize_u32(frame_buf, 0);
+
+    frame_buf.insert(frame_buf.end(), data.begin() + offset, data.begin() + offset + chunk);
+
+    const uint32_t checksum = crc32(frame_buf.data() + checksum_pos + 4, chunk);
+    frame_buf[checksum_pos + 0] = static_cast<uint8_t>(checksum & 0xFFu);
+    frame_buf[checksum_pos + 1] = static_cast<uint8_t>((checksum >> 8) & 0xFFu);
+    frame_buf[checksum_pos + 2] = static_cast<uint8_t>((checksum >> 16) & 0xFFu);
+    frame_buf[checksum_pos + 3] = static_cast<uint8_t>((checksum >> 24) & 0xFFu);
+
+    std::vector<uint8_t> parity = rs::encode(frame_buf, cfg.rs_nsym);
+    frame_buf.insert(frame_buf.end(), parity.begin(), parity.end());
+    return frame_buf;
+}
+
+static void write_frame_pair(const cv::Mat& img, const cv::Mat& black, const std::string& temp_dir, size_t& frame_count) {
+    const std::string frame_path = temp_dir + "/frame_" + std::to_string(frame_count++) + ".png";
+    cv::imwrite(frame_path, img);
+    const std::string black_path = temp_dir + "/frame_" + std::to_string(frame_count++) + ".png";
+    cv::imwrite(black_path, black);
+}
+
 int main(int argc, char* argv[]) {
     if (argc != 4) {
         print_usage(argv[0]);
@@ -84,23 +145,7 @@ int main(int argc, char* argv[]) {
     size_t frame_count = 0;
 
     // Write a small bootstrap frame (unprotected) that carries parameters needed to decode
-    std::vector<uint8_t> bootstrap_buf;
-    // magic
-    serialize_u32(bootstrap_buf, MAGIC);
-    // version
-    serialize_u8(bootstrap_buf, FORMAT_VERSION);
-    // rs_nsym
-    serialize_u32(bootstrap_buf, static_cast<uint32_t>(cfg.rs_nsym));
-    // cell_size
-    serialize_u32(bootstrap_buf, static_cast<uint32_t>(cfg.cell_size));
-    // cells_per_row
-    serialize_u32(bootstrap_buf, static_cast<uint32_t>(cfg.cells_per_row));
-    // payload_bytes_per_frame
-    serialize_u32(bootstrap_buf, static_cast<uint32_t>(cfg.payload_bytes_per_frame));
-    // fps
-    serialize_u32(bootstrap_buf, static_cast<uint32_t>(cfg.fps));
-    // reference_block_size
-    serialize_u32(bootstrap_buf, static_cast<uint32_t>(cfg.reference_block_size));
+    std::vector<uint8_t> bootstrap_buf = build_bootstrap(cfg);
 
     render_frame(first_img, bootstrap_buf, cfg);
     cv::Mat black0 = first_img.clone(); black0.setTo(cv::Scalar(0, 0, 0));
@@ -108,46 +153,16 @@ int main(int argc, char* argv[]) {
     // Repeat bootstrap frame a few times to improve robustness
     const int BOOTSTRAP_REPEAT = 3;
     for (int i = 0; i < BOOTSTRAP_REPEAT; ++i) {
-        const std::string frame_path = temp_dir + "/frame_" + std::to_string(frame_count++) + ".png";
-        cv::imwrite(frame_path, first_img);
-        const std::string black_path = temp_dir + "/frame_" + std::to_string(frame_count++) + ".png";
-        cv::imwrite(black_path, black0);
+        write_frame_pair(first_img, black0, temp_dir, frame_count);
     }
 
     // Now write the StreamHeader protected by RS parity
-    std::vector<uint8_t> stream_buf;
-    // magic
-    serialize_u32(stream_buf, MAGIC);
-    // version
-    serialize_u8(stream_buf, FORMAT_VERSION);
-    // total_data_bytes (u64)
-    serialize_u64(stream_buf, static_cast<uint64_t>(data.size()));
-    // encoding (u8)
-    serialize_u8(stream_buf, static_cast<uint8_t>(Encoding::Binary));
-    // fps
-    serialize_u32(stream_buf, static_cast<uint32_t>(cfg.fps));
-    // cell_size
-    serialize_u32(stream_buf, static_cast<uint32_t>(cfg.cell_size));
-    // rs_nsym
-    serialize_u32(stream_buf, static_cast<uint32_t>(cfg.rs_nsym));
-    // payload_bytes_per_frame
-    serialize_u32(stream_buf, static_cast<uint32_t>(cfg.payload_bytes_per_frame));
-    // cells_per_row
-    serialize_u32(stream_buf, static_cast<uint32_t>(cfg.cells_per_row));
-    // total_frames
-    serialize_u32(stream_buf, total_frames);
-
-    // append RS parity to stream header
-    std::vector<uint8_t> stream_parity = rs::encode(stream_buf, cfg.rs_nsym);
-    stream_buf.insert(stream_buf.end(), stream_parity.begin(), stream_parity.end());
+    std::vector<uint8_t> stream_buf = build_stream_header(cfg, data.size(), total_frames);
     render_frame(first_img, stream_buf, cfg);
     // Repeat RS-protected StreamHeader several times to ensure decoder captures it
     const int STREAMHDR_REPEAT = 3;
     for (int i = 0; i < STREAMHDR_REPEAT; ++i) {
-        const std::string frame_path = temp_dir + "/frame_" + std::to_string(frame_count++) + ".png";
-        cv::imwrite(frame_path, first_img);
-        const std::string black_path = temp_dir + "/frame_" + std::to_string(frame_count++) + ".png";
-        cv::imwrite(black_path, black0);
+        write_frame_pair(first_img, black0, temp_dir, frame_count);
     }
 
     for (uint32_t fi = 0; fi < total_frames; ++fi) {
@@ -155,36 +170,7 @@ int main(int argc, char* argv[]) {
         const size_t remain = (offset < data.size()) ? (data.size() - offset) : 0;
         const size_t chunk = std::min(remain, payload_per_frame);
 
-        // Build frame buffer: FrameHeader + payload
-        std::vector<uint8_t> frame_buf;
-        // magic
-        serialize_u32(frame_buf, MAGIC);
-        // version
-        frame_buf.push_back(FORMAT_VERSION);
-        // frame_index
-        serialize_u32(frame_buf, fi);
-        // total_frames
-        serialize_u32(frame_buf, total_frames);
-        // payload_bytes
-        serialize_u32(frame_buf, static_cast<uint32_t>(chunk));
-        // placeholder checksum (will fill after payload appended)
-        const size_t checksum_pos = frame_buf.size();
-        serialize_u32(frame_buf, 0);
-
-        // append payload bytes
-        frame_buf.insert(frame_buf.end(), data.begin() + offset, data.begin() + offset + chunk);
-
-        // compute checksum over payload portion
-        const uint32_t checksum = crc32(frame_buf.data() + checksum_pos + 4, chunk);
-        // write checksum into buffer (little-endian)
-        frame_buf[checksum_pos + 0] = static_cast<uint8_t>(checksum & 0xFFu);
-        frame_buf[checksum_pos + 1] = static_cast<uint8_t>((checksum >> 8) & 0xFFu);
-        frame_buf[checksum_pos + 2] = static_cast<uint8_t>((checksum >> 16) & 0xFFu);
-        frame_buf[checksum_pos + 3] = static_cast<uint8_t>((checksum >> 24) & 0xFFu);
-
-        // Append RS parity bytes
-        std::vector<uint8_t> parity = rs::encode(frame_buf, cfg.rs_nsym);
-        frame_buf.insert(frame_buf.end(), parity.begin(), parity.end());
+        std::vector<uint8_t> frame_buf = build_frame_codeword(fi, total_frames, data, offset, chunk, cfg);
 
         // Render frame image
         render_frame(first_img, frame_buf, cfg);
