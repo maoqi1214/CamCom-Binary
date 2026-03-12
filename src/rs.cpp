@@ -11,14 +11,17 @@ static std::once_flag init_flag;
 
 void init_tables() {
     std::call_once(init_flag, [](){
-        uint8_t x = 1;
+        int x = 1;
         for (int i = 0; i < 255; ++i) {
-            gf_exp[i] = x;
-            gf_log[x] = i;
-            x = x << 1;
-            if (x & 0x100) x ^= 0x11d;
+            gf_exp[i] = static_cast<uint8_t>(x);
+            gf_log[static_cast<uint8_t>(x)] = static_cast<uint8_t>(i);
+            x <<= 1;
+            if (x & 0x100) {
+                x ^= 0x11d;
+            }
         }
         for (int i = 255; i < 512; ++i) gf_exp[i] = gf_exp[i - 255];
+        gf_log[0] = 0;
         tables_inited = true;
     });
 }

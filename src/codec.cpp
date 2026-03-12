@@ -37,10 +37,7 @@ namespace camcom {
         const int img_w = data_w + marker_px * 2;
         const int img_h = data_h + marker_px * 2;
 
-        // Make the frame square by taking the maximum of width and height
-        const int square_size = std::max(img_w, img_h);
-
-        out.create(square_size, square_size, CV_8UC3);
+        out.create(img_h, img_w, CV_8UC3);
         // background gray
         out.setTo(cv::Scalar(128, 128, 128));
 
@@ -58,14 +55,13 @@ namespace camcom {
             };
 
         draw_finder(0, 0);
-        draw_finder(square_size - marker_px, 0);
-        draw_finder(0, square_size - marker_px);
-        draw_finder(square_size - marker_px, square_size - marker_px);
+        draw_finder(img_w - marker_px, 0);
+        draw_finder(0, img_h - marker_px);
+        draw_finder(img_w - marker_px, img_h - marker_px);
 
-        // draw data cells
-        // Calculate center position for data region
-        const int origin_x = (square_size - data_w) / 2;
-        const int origin_y = (square_size - data_h) / 2;
+        // draw data cells: naturally fill canvas inside marker margins
+        const int origin_x = marker_px;
+        const int origin_y = marker_px;
 
         for (int idx = 0; idx < total_cells; ++idx) {
             int r = idx / cells_per_row;

@@ -11,6 +11,7 @@
 #include <vector>
 #include <optional>
 #include <algorithm>
+#include <unordered_map>
 
 using namespace camcom;
 
@@ -53,96 +54,192 @@ static bool decode_rs(std::vector<uint8_t>& codeword, uint32_t nsym) {
 }
 
 static bool try_parse_bootstrap(const std::vector<uint8_t>& sample, EncoderConfig& cfg, uint32_t& stream_rs_nsym) {
-    if (sample.size() < 28) {
-        return false;
-    }
-    const uint8_t* p = sample.data();
-    uint32_t magic = read_u32_le(p); p += 4;
-    uint8_t version = *p; p += 1;
-    if (magic != MAGIC || version != FORMAT_VERSION) {
+    constexpr size_t kBootstrapBytes = 4 + 1 + 6 * 4;
+    if (sample.size() < kBootstrapBytes) {
         return false;
     }
 
-    uint32_t rs_nsym = read_u32_le(p); p += 4;
-    uint32_t cell_size = read_u32_le(p); p += 4;
-    uint32_t cells_per_row = read_u32_le(p); p += 4;
-    uint32_t payload_per = read_u32_le(p); p += 4;
-    uint32_t fps = read_u32_le(p); p += 4;
-    uint32_t reference_block_size = read_u32_le(p); p += 4;
+    for (size_t off = 0; off + kBootstrapBytes <= sample.size(); ++off) {
+        const uint8_t* p = sample.data() + static_cast<std::ptrdiff_t>(off);
+        uint32_t magic = read_u32_le(p); p += 4;
+        uint8_t version = *p; p += 1;
+        if (magic != MAGIC || version != FORMAT_VERSION) {
+            continue;
+        }
 
-    cfg.cell_size = static_cast<int>(cell_size);
-    cfg.fps = static_cast<int>(fps);
-    cfg.payload_bytes_per_frame = static_cast<int>(payload_per);
-    cfg.cells_per_row = static_cast<int>(cells_per_row);
-    cfg.rs_nsym = static_cast<int>(rs_nsym);
-    cfg.reference_block_size = static_cast<int>(reference_block_size);
-    stream_rs_nsym = rs_nsym;
-    return true;
+        uint32_t rs_nsym = read_u32_le(p); p += 4;
+        uint32_t cell_size = read_u32_le(p); p += 4;
+        uint32_t cells_per_row = read_u32_le(p); p += 4;
+        uint32_t payload_per = read_u32_le(p); p += 4;
+        uint32_t fps = read_u32_le(p); p += 4;
+        uint32_t reference_block_size = read_u32_le(p); p += 4;
+
+        if (cell_size == 0 || cells_per_row == 0 || payload_per == 0 || fps == 0 || rs_nsym > 255 || reference_block_size == 0) {
+            continue;
+        }
+
+        cfg.cell_size = static_cast<int>(cell_size);
+        cfg.fps = static_cast<int>(fps);
+        cfg.payload_bytes_per_frame = static_cast<int>(payload_per);
+        cfg.cells_per_row = static_cast<int>(cells_per_row);
+        cfg.rs_nsym = static_cast<int>(rs_nsym);
+        cfg.reference_block_size = static_cast<int>(reference_block_size);
+        stream_rs_nsym = rs_nsym;
+        return true;
+    }
+
+    return false;
 }
 
 static bool try_parse_stream_header(const std::vector<uint8_t>& sample, uint32_t& stream_rs_nsym, EncoderConfig& cfg, uint32_t& expected_total_frames) {
-    std::vector<uint8_t> codeword = sample;
-    if (!decode_rs(codeword, stream_rs_nsym)) {
-        return false;
-    }
-    const uint8_t* p = codeword.data();
-    uint32_t magic = read_u32_le(p); p += 4;
-    uint8_t version = *p; p += 1;
-    if (magic != MAGIC || version != FORMAT_VERSION) {
+    constexpr size_t kStreamHeaderBytes = 4 + 1 + 8 + 1 + 6 * 4;
+    const size_t codeword_len = kStreamHeaderBytes + static_cast<size_t>(stream_rs_nsym);
+    if (sample.size() < codeword_len) {
         return false;
     }
 
-    uint64_t total_data = read_u64_le(p); p += 8;
-    (void)total_data;
-    uint8_t encoding = *p; p += 1;
-    (void)encoding;
-    uint32_t fps = read_u32_le(p); p += 4;
-    uint32_t cell_size = read_u32_le(p); p += 4;
-    uint32_t rs_nsym = read_u32_le(p); p += 4;
-    uint32_t payload_per = read_u32_le(p); p += 4;
-    uint32_t cells_per_row = read_u32_le(p); p += 4;
-    uint32_t total_frames_hdr = read_u32_le(p); p += 4;
+    for (size_t off = 0; off + codeword_len <= sample.size(); ++off) {
+        std::vector<uint8_t> codeword(
+            sample.begin() + static_cast<std::ptrdiff_t>(off),
+            sample.begin() + static_cast<std::ptrdiff_t>(off + codeword_len));
+        if (!decode_rs(codeword, stream_rs_nsym)) {
+            continue;
+        }
 
-    cfg.cell_size = static_cast<int>(cell_size);
-    cfg.fps = static_cast<int>(fps);
-    cfg.payload_bytes_per_frame = static_cast<int>(payload_per);
-    cfg.cells_per_row = static_cast<int>(cells_per_row);
-    cfg.rs_nsym = static_cast<int>(rs_nsym);
-    stream_rs_nsym = rs_nsym;
-    expected_total_frames = total_frames_hdr;
-    return true;
+        const uint8_t* p = codeword.data();
+        uint32_t magic = read_u32_le(p); p += 4;
+        uint8_t version = *p; p += 1;
+        if (magic != MAGIC || version != FORMAT_VERSION) {
+            continue;
+        }
+
+        uint64_t total_data = read_u64_le(p); p += 8;
+        (void)total_data;
+        uint8_t encoding = *p; p += 1;
+        (void)encoding;
+        uint32_t fps = read_u32_le(p); p += 4;
+        uint32_t cell_size = read_u32_le(p); p += 4;
+        uint32_t rs_nsym = read_u32_le(p); p += 4;
+        uint32_t payload_per = read_u32_le(p); p += 4;
+        uint32_t cells_per_row = read_u32_le(p); p += 4;
+        uint32_t total_frames_hdr = read_u32_le(p); p += 4;
+
+        if (cell_size == 0 || payload_per == 0 || cells_per_row == 0 || total_frames_hdr == 0 || rs_nsym > 255) {
+            continue;
+        }
+
+        cfg.cell_size = static_cast<int>(cell_size);
+        cfg.fps = static_cast<int>(fps);
+        cfg.payload_bytes_per_frame = static_cast<int>(payload_per);
+        cfg.cells_per_row = static_cast<int>(cells_per_row);
+        cfg.rs_nsym = static_cast<int>(rs_nsym);
+        stream_rs_nsym = rs_nsym;
+        expected_total_frames = total_frames_hdr;
+        return true;
+    }
+
+    return false;
 }
 
-static bool try_parse_data_frame(const std::vector<uint8_t>& sample, uint32_t stream_rs_nsym, FrameHeader& hdr, std::vector<uint8_t>& payload_out) {
-    std::vector<uint8_t> codeword = sample;
-    if (!decode_rs(codeword, stream_rs_nsym)) {
+static bool try_parse_data_frame(const std::vector<uint8_t>& sample, uint32_t stream_rs_nsym, const EncoderConfig& cfg, FrameHeader& hdr, std::vector<uint8_t>& payload_out) {
+    constexpr size_t kFrameHeaderBytes = 4 + 1 + 4 + 4 + 4 + 4;
+    if (sample.size() < kFrameHeaderBytes + static_cast<size_t>(stream_rs_nsym)) {
         return false;
     }
 
-    const uint8_t* p = codeword.data();
-    hdr.magic = read_u32_le(p); p += 4;
-    hdr.version = *p; p += 1;
-    hdr.frame_index = read_u32_le(p); p += 4;
-    hdr.total_frames = read_u32_le(p); p += 4;
-    hdr.payload_bytes = read_u32_le(p); p += 4;
-    hdr.checksum = read_u32_le(p); p += 4;
+    const size_t full_payload_codeword = kFrameHeaderBytes + static_cast<size_t>(cfg.payload_bytes_per_frame) + static_cast<size_t>(stream_rs_nsym);
+    if (cfg.payload_bytes_per_frame > 0 && sample.size() >= full_payload_codeword) {
+        for (size_t off = 0; off + full_payload_codeword <= sample.size(); ++off) {
+            std::vector<uint8_t> codeword(
+                sample.begin() + static_cast<std::ptrdiff_t>(off),
+                sample.begin() + static_cast<std::ptrdiff_t>(off + full_payload_codeword));
+            if (!decode_rs(codeword, stream_rs_nsym)) {
+                continue;
+            }
 
-    if (hdr.magic != MAGIC || hdr.version != FORMAT_VERSION) {
-        return false;
+            const uint8_t* p = codeword.data();
+            FrameHeader local{};
+            local.magic = read_u32_le(p); p += 4;
+            local.version = *p; p += 1;
+            local.frame_index = read_u32_le(p); p += 4;
+            local.total_frames = read_u32_le(p); p += 4;
+            local.payload_bytes = read_u32_le(p); p += 4;
+            local.checksum = read_u32_le(p); p += 4;
+
+            if (local.magic != MAGIC || local.version != FORMAT_VERSION) {
+                continue;
+            }
+            if (local.total_frames == 0 || local.frame_index >= local.total_frames) {
+                continue;
+            }
+            if (local.payload_bytes == 0 || local.payload_bytes > static_cast<uint32_t>(cfg.payload_bytes_per_frame)) {
+                continue;
+            }
+
+            const size_t payload_len = static_cast<size_t>(local.payload_bytes);
+            if (p + payload_len > codeword.data() + codeword.size()) {
+                continue;
+            }
+
+            const uint32_t calc = crc32(p, payload_len);
+            if (calc != local.checksum) {
+                continue;
+            }
+
+            hdr = local;
+            payload_out.assign(p, p + payload_len);
+            return true;
+        }
     }
 
-    size_t payload_len = hdr.payload_bytes;
-    if (p + payload_len > codeword.data() + codeword.size()) {
-        return false;
+    const size_t min_codeword_len = kFrameHeaderBytes + static_cast<size_t>(stream_rs_nsym);
+    for (size_t off = 0; off + min_codeword_len <= sample.size(); ++off) {
+        const size_t max_codeword_len = sample.size() - off;
+        for (size_t codeword_len = max_codeword_len; codeword_len >= min_codeword_len; --codeword_len) {
+            std::vector<uint8_t> codeword(
+                sample.begin() + static_cast<std::ptrdiff_t>(off),
+                sample.begin() + static_cast<std::ptrdiff_t>(off + codeword_len));
+            if (!decode_rs(codeword, stream_rs_nsym)) {
+                continue;
+            }
+
+            const uint8_t* p = codeword.data();
+            FrameHeader local{};
+            local.magic = read_u32_le(p); p += 4;
+            local.version = *p; p += 1;
+            local.frame_index = read_u32_le(p); p += 4;
+            local.total_frames = read_u32_le(p); p += 4;
+            local.payload_bytes = read_u32_le(p); p += 4;
+            local.checksum = read_u32_le(p); p += 4;
+
+            if (local.magic != MAGIC || local.version != FORMAT_VERSION) {
+                continue;
+            }
+            if (local.total_frames == 0 || local.frame_index >= local.total_frames) {
+                continue;
+            }
+
+            const size_t payload_len = static_cast<size_t>(local.payload_bytes);
+            const size_t expected_codeword_len = kFrameHeaderBytes + payload_len + static_cast<size_t>(stream_rs_nsym);
+            if (expected_codeword_len != codeword_len) {
+                continue;
+            }
+            if (p + payload_len > codeword.data() + codeword.size()) {
+                continue;
+            }
+
+            const uint32_t calc = crc32(p, payload_len);
+            if (calc != local.checksum) {
+                continue;
+            }
+
+            hdr = local;
+            payload_out.assign(p, p + payload_len);
+            return true;
+        }
     }
 
-    const uint32_t calc = crc32(p, payload_len);
-    if (calc != hdr.checksum) {
-        return false;
-    }
-
-    payload_out.assign(p, p + payload_len);
-    return true;
+    return false;
 }
 
 int main(int argc, char* argv[]) {
@@ -178,7 +275,7 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "[decoder] Video opened successfully\n";
 
-    std::vector<std::vector<uint8_t>> frames_buffer;
+    std::unordered_map<uint32_t, std::vector<uint8_t>> frames_buffer;
     uint32_t expected_total_frames = 0;
     bool have_bootstrap = false;
     bool have_stream_header = false;
@@ -191,7 +288,9 @@ int main(int argc, char* argv[]) {
         frame_count++;
         std::cout << "[decoder] Processing frame " << frame_count << "\n";
 
-        // Do not skip dark frames; some captures may be low-light.
+        if (is_black_frame(frame)) {
+            continue;
+        }
 
         std::vector<uint8_t> sample;
         if (!sample_frame(frame, sample, cfg)) {
@@ -204,37 +303,28 @@ int main(int argc, char* argv[]) {
                 have_bootstrap = true;
                 std::cout << "[decoder] Found bootstrap frame with config: cell_size=" << cfg.cell_size << ", cells_per_row=" << cfg.cells_per_row << "\n";
             }
-            else {
-                std::cout << "[decoder] Not a bootstrap frame\n";
-            }
             continue;
         }
 
         if (!have_stream_header) {
             if (try_parse_stream_header(sample, stream_rs_nsym, cfg, expected_total_frames)) {
                 have_stream_header = true;
-                frames_buffer.resize(expected_total_frames);
                 std::cout << "[decoder] Found stream header: total_frames=" << expected_total_frames << "\n";
             }
-            else {
-                std::cout << "[decoder] Not a stream header\n";
-            }
-            continue;
         }
 
         FrameHeader hdr{};
         std::vector<uint8_t> payload;
-        if (!try_parse_data_frame(sample, stream_rs_nsym, hdr, payload)) {
-            std::cout << "[decoder] Failed to decode data frame\n";
+        if (!try_parse_data_frame(sample, stream_rs_nsym, cfg, hdr, payload)) {
             continue;
         }
 
         if (hdr.total_frames > 0 && expected_total_frames == 0) {
             expected_total_frames = hdr.total_frames;
-            frames_buffer.resize(expected_total_frames);
         }
 
-        if (hdr.frame_index < frames_buffer.size()) {
+        auto it = frames_buffer.find(hdr.frame_index);
+        if (it == frames_buffer.end() || it->second.empty()) {
             frames_buffer[hdr.frame_index] = std::move(payload);
             std::cout << "[decoder] Decoded frame " << hdr.frame_index << " of " << hdr.total_frames << "\n";
         }
@@ -243,12 +333,23 @@ int main(int argc, char* argv[]) {
     // reassemble
     std::vector<uint8_t> recovered;
     if (expected_total_frames == 0) {
+        if (!frames_buffer.empty()) {
+            uint32_t max_index = 0;
+            for (const auto& kv : frames_buffer) {
+                max_index = std::max(max_index, kv.first);
+            }
+            expected_total_frames = max_index + 1;
+        }
+    }
+
+    if (expected_total_frames == 0) {
         std::cerr << "Warning: no frames decoded successfully." << std::endl;
     }
     else {
         for (uint32_t i = 0; i < expected_total_frames; ++i) {
-            if (i < frames_buffer.size() && !frames_buffer[i].empty()) {
-                recovered.insert(recovered.end(), frames_buffer[i].begin(), frames_buffer[i].end());
+            auto it = frames_buffer.find(i);
+            if (it != frames_buffer.end() && !it->second.empty()) {
+                recovered.insert(recovered.end(), it->second.begin(), it->second.end());
             }
             else {
                 // missing frame -> skip (could insert zeros)

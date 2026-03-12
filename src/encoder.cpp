@@ -99,6 +99,14 @@ static void write_frame_pair(const cv::Mat& img, const cv::Mat& black, const std
     cv::imwrite(black_path, black);
 }
 
+static cv::Mat fit_to_video_canvas(const cv::Mat& src, int canvas_w, int canvas_h) {
+    cv::Mat dst(canvas_h, canvas_w, CV_8UC3, cv::Scalar(128, 128, 128));
+    const int w = std::min(src.cols, canvas_w);
+    const int h = std::min(src.rows, canvas_h);
+    src(cv::Rect(0, 0, w, h)).copyTo(dst(cv::Rect(0, 0, w, h)));
+    return dst;
+}
+
 int main(int argc, char* argv[]) {
     if (argc != 4) {
         print_usage(argv[0]);
@@ -127,9 +135,21 @@ int main(int argc, char* argv[]) {
 
     EncoderConfig cfg;
     cfg.fps = fps;
+    // Data grid target: 108 points per row.
+    // Increased cell_size to 8 to survive H.264 YUV420p chroma sub-sampling.
+    cfg.cell_size = 8;
+    cfg.cells_per_row = 108;
+    cfg.payload_bytes_per_frame = 2875;
 
     const size_t payload_per_frame = static_cast<size_t>(cfg.payload_bytes_per_frame);
     const uint32_t total_frames = static_cast<uint32_t>((data.size() + payload_per_frame - 1) / payload_per_frame);
+
+    const int frame_header_bytes = 4 + 1 + 4 + 4 + 4 + 4;
+    const int max_codeword_bytes = frame_header_bytes + cfg.payload_bytes_per_frame + cfg.rs_nsym;
+    const int max_cells = max_codeword_bytes * 4;
+    const int max_rows = static_cast<int>((max_cells + cfg.cells_per_row - 1) / cfg.cells_per_row);
+    const int video_w = (cfg.cells_per_row + 8) * cfg.cell_size;
+    const int video_h = (max_rows + 8) * cfg.cell_size;
 
     std::cout << "[encoder] total bytes=" << data.size() << " frames=" << total_frames << "\n";
 
@@ -148,7 +168,8 @@ int main(int argc, char* argv[]) {
     std::vector<uint8_t> bootstrap_buf = build_bootstrap(cfg);
 
     render_frame(first_img, bootstrap_buf, cfg);
-    cv::Mat black0 = first_img.clone(); black0.setTo(cv::Scalar(0, 0, 0));
+    first_img = fit_to_video_canvas(first_img, video_w, video_h);
+    cv::Mat black0(video_h, video_w, CV_8UC3, cv::Scalar(0, 0, 0));
 
     // Repeat bootstrap frame a few times to improve robustness
     const int BOOTSTRAP_REPEAT = 3;
@@ -159,6 +180,7 @@ int main(int argc, char* argv[]) {
     // Now write the StreamHeader protected by RS parity
     std::vector<uint8_t> stream_buf = build_stream_header(cfg, data.size(), total_frames);
     render_frame(first_img, stream_buf, cfg);
+    first_img = fit_to_video_canvas(first_img, video_w, video_h);
     // Repeat RS-protected StreamHeader several times to ensure decoder captures it
     const int STREAMHDR_REPEAT = 3;
     for (int i = 0; i < STREAMHDR_REPEAT; ++i) {
@@ -174,18 +196,22 @@ int main(int argc, char* argv[]) {
 
         // Render frame image
         render_frame(first_img, frame_buf, cfg);
+        first_img = fit_to_video_canvas(first_img, video_w, video_h);
         const std::string frame_path = temp_dir + "/frame_" + std::to_string(frame_count++) + ".png";
         cv::imwrite(frame_path, first_img);
 
         // insert a black transition frame to reduce motion blur artifacts
-        cv::Mat black = first_img.clone();
-        black.setTo(cv::Scalar(0, 0, 0));
+        cv::Mat black(video_h, video_w, CV_8UC3, cv::Scalar(0, 0, 0));
         const std::string black_path = temp_dir + "/frame_" + std::to_string(frame_count++) + ".png";
         cv::imwrite(black_path, black);
     }
 
     // Use ffmpeg to create video from frames
-    std::string ffmpeg_cmd = "ffmpeg -y -framerate " + std::to_string(fps) + " -i " + temp_dir + "/frame_%d.png -c:v libx264 -pix_fmt yuv420p " + output_path;
+    std::string ffmpeg_cmd =
+        "ffmpeg -y -framerate " + std::to_string(fps) +
+        " -i " + temp_dir +
+        "/frame_%d.png -c:v libx264 -crf 12 -preset slow -pix_fmt yuv420p " +
+        output_path;
     std::cout << "[encoder] Running ffmpeg command: " << ffmpeg_cmd << "\n";
     int ffmpeg_result = system(ffmpeg_cmd.c_str());
     if (ffmpeg_result != 0) {

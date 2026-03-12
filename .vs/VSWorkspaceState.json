@@ -12,9 +12,10 @@
     "\\build",
     "\\docs",
     "\\include",
+    "\\out",
+    "\\out\\build",
     "\\src",
     "\\tests"
   ],
-  "SelectedNode": "\\CMakeLists.txt",
   "PreviewInSolutionExplorer": false
 }
