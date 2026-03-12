@@ -66,7 +66,7 @@ std::vector<uint8_t> encode(const std::vector<uint8_t>& msg, int nsym) {
     std::vector<uint8_t> parity(nsym, 0);
     for (size_t i = 0; i < msg.size(); ++i) {
         uint8_t factor = msg[i] ^ parity[0];
-        // shift left
+        // 余数寄存器左移
         for (int j = 0; j < nsym-1; ++j) parity[j] = parity[j+1];
         parity[nsym-1] = 0;
         if (factor != 0) {
@@ -78,7 +78,7 @@ std::vector<uint8_t> encode(const std::vector<uint8_t>& msg, int nsym) {
     return parity;
 }
 
-// Evaluate polynomial (coeffs in ascending order) at x
+// 在 x 点计算多项式值（系数按升幂排列）
 static uint8_t poly_eval(const std::vector<uint8_t>& poly, uint8_t x) {
     uint8_t y = 0;
     for (int i = static_cast<int>(poly.size()) - 1; i >= 0; --i) {
@@ -87,7 +87,7 @@ static uint8_t poly_eval(const std::vector<uint8_t>& poly, uint8_t x) {
     return y;
 }
 
-// Berlekamp-Massey to compute error locator polynomial from syndromes
+// 使用 Berlekamp-Massey 算法由综合项计算错误定位多项式
 static std::vector<uint8_t> berlekamp_massey(const std::vector<uint8_t>& synd, int nsym) {
     std::vector<uint8_t> C(1,1);
     std::vector<uint8_t> B(1,1);
@@ -106,7 +106,7 @@ static std::vector<uint8_t> berlekamp_massey(const std::vector<uint8_t>& synd, i
             uint8_t coef = d;
             uint8_t inv_b = gf_exp[(255 - gf_log[b]) % 255];
             uint8_t scale = gf_mul(coef, inv_b);
-            // C = C - scale * x^m * B
+            // C = C - scale * x^m * B（GF(2^8) 上减法等价于异或）
             std::vector<uint8_t> scaled(B.size() + m);
             for (size_t i = 0; i < B.size(); ++i) scaled[i + m] = gf_mul(B[i], scale);
             C.resize(std::max(C.size(), scaled.size()));
@@ -135,15 +135,15 @@ static std::vector<int> find_error_locations(const std::vector<uint8_t>& err_loc
     for (int i = 0; i < 255; ++i) {
         uint8_t x = gf_exp[i];
         uint8_t y = 0;
-        // evaluate err_loc at x^{-1}
+        // 在 x^{-1} 处计算 err_loc
         uint8_t xi = gf_exp[(255 - i) % 255];
-        // Horner
+        // Horner 法求值
         uint8_t sum = 0;
         for (int j = static_cast<int>(err_loc.size()) - 1; j >= 0; --j) {
             sum = gf_mul(sum, xi) ^ err_loc[j];
         }
         if (sum == 0) {
-            // error at position (255 - i)
+            // 错误位置为 (255 - i)
             locs.push_back(255 - i);
             if ((int)locs.size() == errs) break;
         }
@@ -152,7 +152,7 @@ static std::vector<int> find_error_locations(const std::vector<uint8_t>& err_loc
 }
 
 static std::vector<uint8_t> calc_error_evaluator(const std::vector<uint8_t>& synd, const std::vector<uint8_t>& err_loc, int nsym) {
-    // omega(x) = [synd(x) * err_loc(x)] mod x^nsym
+    // 计算 omega(x) = [synd(x) * err_loc(x)] mod x^nsym
     std::vector<uint8_t> prod = poly_mul(synd, err_loc);
     prod.resize(nsym);
     return prod;
@@ -167,12 +167,12 @@ bool decode(std::vector<uint8_t>& codeword, int nsym) {
     init_tables();
     const int n = static_cast<int>(codeword.size());
     if (nsym <= 0 || nsym >= n) return false;
-    // compute syndromes S1..S_nsym
+    // 计算综合项 S1..S_nsym
     std::vector<uint8_t> synd(nsym);
     bool all_zero = true;
     for (int i = 0; i < nsym; ++i) {
         uint8_t s = 0;
-        uint8_t x = gf_exp[i]; // alpha^{i}
+        uint8_t x = gf_exp[i]; // α^{i}
         for (int j = 0; j < n; ++j) {
             s = gf_mul(s, x) ^ codeword[j];
         }
@@ -181,48 +181,48 @@ bool decode(std::vector<uint8_t>& codeword, int nsym) {
     }
     if (all_zero) return true;
 
-    // construct syndrome polynomial (ascending)
-    std::vector<uint8_t> synd_poly = synd; // synd[0] = S1
+    // 构造综合多项式（升幂）
+    std::vector<uint8_t> synd_poly = synd; // synd[0] 对应 S1
 
-    // get error locator via Berlekamp-Massey
+    // 使用 Berlekamp-Massey 求错误定位多项式
     std::vector<uint8_t> err_loc = berlekamp_massey(synd_poly, nsym);
     int errs = static_cast<int>(err_loc.size()) - 1;
     if (errs * 2 > nsym) return false;
 
-    // find error locations
+    // 查找错误位置
     std::vector<int> pos = find_error_locations(err_loc);
     if (pos.empty()) return false;
 
-    // compute error evaluator
+    // 计算错误求值多项式
     std::vector<uint8_t> err_eval = calc_error_evaluator(synd_poly, err_loc, nsym);
 
-    // Forney algorithm to compute magnitudes
+    // 使用 Forney 算法计算错误幅值
     for (size_t i = 0; i < pos.size(); ++i) {
         int position = pos[i];
-        int xi_inv = (255 - position) % 255; // alpha^{-position}
+        int xi_inv = (255 - position) % 255; // α^{-position}
         uint8_t x = gf_exp[xi_inv];
 
-        // compute err_loc_prime(x)
+        // 计算 err_loc_prime(x)
         uint8_t denom = 0;
         for (int j = 1; j < static_cast<int>(err_loc.size()); ++j) {
             denom ^= gf_mul(err_loc[j], gf_pow(x, j));
         }
         if (denom == 0) return false;
 
-        // evaluate err_eval at x
+        // 在 x 处计算 err_eval
         uint8_t y = 0;
         for (int j = static_cast<int>(err_eval.size()) - 1; j >= 0; --j) {
             y = gf_mul(y, x) ^ err_eval[j];
         }
         uint8_t magnitude = gf_mul(y, gf_inverse(denom));
 
-        // apply correction: position is index from left? map to codeword index
+        // 应用纠错：将位置映射到 codeword 下标
         int idx = n - 1 - position;
         if (idx < 0 || idx >= n) return false;
         codeword[idx] ^= magnitude;
     }
 
-    // verify syndromes are now zero
+    // 校验综合项是否全部归零
     for (int i = 0; i < nsym; ++i) {
         uint8_t s = 0;
         uint8_t x = gf_exp[i];

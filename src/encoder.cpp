@@ -135,8 +135,8 @@ int main(int argc, char* argv[]) {
 
     EncoderConfig cfg;
     cfg.fps = fps;
-    // Data grid target: 108 points per row.
-    // Increased cell_size to 8 to survive H.264 YUV420p chroma sub-sampling.
+    // 数据网格目标：每行 108 个点。
+    // 将 cell_size 提升到 8，以提高在 H.264 YUV420p 色度子采样下的稳定性。
     cfg.cell_size = 8;
     cfg.cells_per_row = 108;
     cfg.payload_bytes_per_frame = 2875;
@@ -148,14 +148,14 @@ int main(int argc, char* argv[]) {
     const int max_codeword_bytes = frame_header_bytes + cfg.payload_bytes_per_frame + cfg.rs_nsym;
     const int max_cells = max_codeword_bytes * 4;
     const int max_rows = static_cast<int>((max_cells + cfg.cells_per_row - 1) / cfg.cells_per_row);
-    const int video_w = (cfg.cells_per_row + 8) * cfg.cell_size;
-    const int video_h = (max_rows + 8) * cfg.cell_size;
+    const int video_w = (cfg.cells_per_row + 2 * FINDER_MARKER_CELLS) * cfg.cell_size;
+    const int video_h = (max_rows + 2 * FINDER_MARKER_CELLS) * cfg.cell_size;
 
     std::cout << "[encoder] total bytes=" << data.size() << " frames=" << total_frames << "\n";
 
     cv::Mat first_img;
 
-    // Create temporary directory for frames
+    // 创建临时帧目录
     const std::string temp_dir = "temp_frames";
     if (fs::exists(temp_dir)) {
         fs::remove_all(temp_dir);
@@ -164,24 +164,24 @@ int main(int argc, char* argv[]) {
 
     size_t frame_count = 0;
 
-    // Write a small bootstrap frame (unprotected) that carries parameters needed to decode
+    // 写入小型 Bootstrap 帧（不加保护），携带解码所需参数
     std::vector<uint8_t> bootstrap_buf = build_bootstrap(cfg);
 
     render_frame(first_img, bootstrap_buf, cfg);
     first_img = fit_to_video_canvas(first_img, video_w, video_h);
     cv::Mat black0(video_h, video_w, CV_8UC3, cv::Scalar(0, 0, 0));
 
-    // Repeat bootstrap frame a few times to improve robustness
+    // 重复输出若干次 Bootstrap 帧，提升鲁棒性
     const int BOOTSTRAP_REPEAT = 3;
     for (int i = 0; i < BOOTSTRAP_REPEAT; ++i) {
         write_frame_pair(first_img, black0, temp_dir, frame_count);
     }
 
-    // Now write the StreamHeader protected by RS parity
+    // 写入带 RS 冗余保护的 StreamHeader
     std::vector<uint8_t> stream_buf = build_stream_header(cfg, data.size(), total_frames);
     render_frame(first_img, stream_buf, cfg);
     first_img = fit_to_video_canvas(first_img, video_w, video_h);
-    // Repeat RS-protected StreamHeader several times to ensure decoder captures it
+    // 多次重复输出受 RS 保护的 StreamHeader，确保解码端更容易捕获
     const int STREAMHDR_REPEAT = 3;
     for (int i = 0; i < STREAMHDR_REPEAT; ++i) {
         write_frame_pair(first_img, black0, temp_dir, frame_count);
@@ -194,19 +194,19 @@ int main(int argc, char* argv[]) {
 
         std::vector<uint8_t> frame_buf = build_frame_codeword(fi, total_frames, data, offset, chunk, cfg);
 
-        // Render frame image
+        // 渲染数据帧图像
         render_frame(first_img, frame_buf, cfg);
         first_img = fit_to_video_canvas(first_img, video_w, video_h);
         const std::string frame_path = temp_dir + "/frame_" + std::to_string(frame_count++) + ".png";
         cv::imwrite(frame_path, first_img);
 
-        // insert a black transition frame to reduce motion blur artifacts
+        // 插入黑色过渡帧，降低运动模糊伪影影响
         cv::Mat black(video_h, video_w, CV_8UC3, cv::Scalar(0, 0, 0));
         const std::string black_path = temp_dir + "/frame_" + std::to_string(frame_count++) + ".png";
         cv::imwrite(black_path, black);
     }
 
-    // Use ffmpeg to create video from frames
+    // 使用 ffmpeg 将图像序列合成为视频
     std::string ffmpeg_cmd =
         "ffmpeg -y -framerate " + std::to_string(fps) +
         " -i " + temp_dir +
@@ -216,12 +216,12 @@ int main(int argc, char* argv[]) {
     int ffmpeg_result = system(ffmpeg_cmd.c_str());
     if (ffmpeg_result != 0) {
         std::cerr << "Error: ffmpeg command failed with exit code " << ffmpeg_result << "\n";
-        // Clean up temporary files
+        // 清理临时文件
         fs::remove_all(temp_dir);
         return static_cast<int>(ExitCode::EncodingError);
     }
 
-    // Clean up temporary files
+    // 清理临时文件
     fs::remove_all(temp_dir);
 
     std::cout << "[encoder] Done.\n";

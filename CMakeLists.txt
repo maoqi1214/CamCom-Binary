@@ -2,43 +2,28 @@ cmake_minimum_required(VERSION 3.16)
 
 project(CamComBinary
   VERSION 0.1.0
-  DESCRIPTION "Screen-to-Camera Binary Transmission System"
+  DESCRIPTION "屏幕到相机的二进制传输系统"
   LANGUAGES CXX
 )
 
+# ===== C++ 标准配置 =====
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Helpful warnings (optional)
+# ===== 编译告警等级 =====
 if(MSVC)
   add_compile_options(/W4)
 else()
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-# ---- OpenCV ----
+# ===== 第三方依赖：OpenCV =====
+# 说明：本项目运行时通过命令行调用 ffmpeg 可执行文件，不直接链接 FFmpeg 开发库。
+# 因此这里仅保留 OpenCV 作为编译期依赖，移除对本地硬编码 FFmpeg 库变量的依赖。
 find_package(OpenCV REQUIRED)
 
-# ---- FFmpeg (libavcodec, libavformat, libavutil) ----
-# Prefer pkg-config when available (Linux/macOS). On Windows, user may need to set paths manually.
-#     find_package(PkgConfig QUIET)
-if(PkgConfig_FOUND)
-  pkg_check_modules(AVCODEC REQUIRED libavcodec)
-  pkg_check_modules(AVFORMAT REQUIRED libavformat)
-  pkg_check_modules(AVUTIL REQUIRED libavutil)
-else()
-  message(WARNING "PkgConfig not found. You may need to set FFmpeg include/library paths manually.")
-  # Fallback variables (user can set via -D... on the CMake command line)
-  set(AVCODEC_INCLUDE_DIRS "" CACHE PATH "FFmpeg libavcodec include dir")
-  set(AVFORMAT_INCLUDE_DIRS "" CACHE PATH "FFmpeg libavformat include dir")
-  set(AVUTIL_INCLUDE_DIRS "" CACHE PATH "FFmpeg libavutil include dir")
-
-  set(AVCODEC_LIBRARIES avcodec CACHE STRING "FFmpeg libavcodec library")
-  set(AVFORMAT_LIBRARIES avformat CACHE STRING "FFmpeg libavformat library")
-  set(AVUTIL_LIBRARIES avutil CACHE STRING "FFmpeg libavutil library")
-endif()
-
+# ===== 核心库 =====
 add_library(camcom_core
   src/common.cpp
   src/io.cpp
@@ -51,28 +36,22 @@ target_include_directories(camcom_core
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${OpenCV_INCLUDE_DIRS}
-    ${AVCODEC_INCLUDE_DIRS}
-    ${AVFORMAT_INCLUDE_DIRS}
-    ${AVUTIL_INCLUDE_DIRS}
 )
 
 target_link_libraries(camcom_core
   PUBLIC
     ${OpenCV_LIBS}
-    ${AVCODEC_LIBRARIES}
-    ${AVFORMAT_LIBRARIES}
-    ${AVUTIL_LIBRARIES}
 )
 
-# ---- encoder executable ----
+# ===== 可执行文件：encoder =====
 add_executable(encoder src/encoder.cpp)
 target_link_libraries(encoder PRIVATE camcom_core)
 
-# ---- decoder executable ----
+# ===== 可执行文件：decoder =====
 add_executable(decoder src/decoder.cpp)
 target_link_libraries(decoder PRIVATE camcom_core)
 
-# ---- unit tests ----
+# ===== 测试程序 =====
 add_executable(rs_unit_test tests/rs_unit_test.cpp)
 target_link_libraries(rs_unit_test PRIVATE camcom_core)
 
@@ -82,7 +61,8 @@ target_link_libraries(integration_test PRIVATE camcom_core)
 add_executable(integration_metrics tests/integration_metrics.cpp)
 target_link_libraries(integration_metrics PRIVATE camcom_core)
 
-# Place binaries in build/bin
+# ===== 输出目录 =====
+# 将主要可执行文件统一输出到 build/bin 目录
 set_target_properties(encoder decoder PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )

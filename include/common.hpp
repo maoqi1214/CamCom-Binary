@@ -5,28 +5,31 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// Project-wide constants
+// 项目级常量
 // ---------------------------------------------------------------------------
 
 namespace camcom {
 
-/// Magic bytes written at the start of every encoded stream.
+/// 每段编码流开头写入的魔术字。
 constexpr uint32_t MAGIC = 0x43414D43; // "CAMC"
 
-/// Current file-format version.
+/// 当前文件格式版本。
 constexpr uint8_t FORMAT_VERSION = 1;
 
-/// Default frames per second for encoded output video.
+/// 编码输出视频的默认帧率。
 constexpr int DEFAULT_FPS = 30;
 
-/// Size of the QR / data-matrix cell in pixels (width == height).
+/// 数据单元格大小（像素，宽高相等）。
 constexpr int DEFAULT_CELL_SIZE = 20;
 
+/// 四角定位块边长（按单元格计）。
+constexpr int FINDER_MARKER_CELLS = 6;
+
 // ---------------------------------------------------------------------------
-// Shared types and enums
+// 共享类型与枚举
 // ---------------------------------------------------------------------------
 
-/// Exit codes used by both encoder and decoder.
+/// 编码器与解码器共用退出码。
 enum class ExitCode : int {
     Ok              = 0,
     BadArgs         = 1,
@@ -35,38 +38,38 @@ enum class ExitCode : int {
     DecodingError   = 4,
 };
 
-/// Encoding scheme used to map bytes to visual symbols.
+/// 将字节映射为视觉符号时使用的编码方案。
 enum class Encoding : uint8_t {
-    Binary = 0, ///< Pure black/white pixel blocks.
-    Gray4  = 1, ///< 4-level grayscale (2 bits per cell).
-    // TODO: add further encoding modes as needed
+    Binary = 0, ///< 纯黑白像素块。
+    Gray4  = 1, ///< 四级灰度（每格 2 bit）。
+    // TODO: 按需扩展更多编码模式
 };
 
-/// Compute a simple CRC-32 (ISO 3309 polynomial) over the supplied byte range.
+/// 对给定字节范围计算 CRC-32（ISO 3309 多项式）。
 uint32_t crc32(const uint8_t* data, std::size_t length);
 
-/// Per-frame header embedded in the video stream.
+/// 视频流中每帧携带的帧头。
 struct FrameHeader {
-    uint32_t magic;          ///< Must equal MAGIC.
-    uint8_t  version;        ///< FORMAT_VERSION.
-    uint32_t frame_index;    ///< 0-based frame number.
-    uint32_t total_frames;   ///< Total number of data frames in this stream.
-    uint32_t payload_bytes;  ///< Number of data bytes carried in this frame.
-    uint32_t checksum;       ///< CRC-32 of the payload bytes in this frame.
+    uint32_t magic;          ///< 必须等于 MAGIC。
+    uint8_t  version;        ///< FORMAT_VERSION。
+    uint32_t frame_index;    ///< 从 0 开始的帧序号。
+    uint32_t total_frames;   ///< 当前流中的总数据帧数。
+    uint32_t payload_bytes;  ///< 当前帧携带的数据字节数。
+    uint32_t checksum;       ///< 当前帧载荷字节的 CRC-32。
 };
 
-/// Top-level stream header (written once at the start of the first frame).
+/// 顶层流头（在首帧开始处写入一次）。
 struct StreamHeader {
-    uint32_t magic;           ///< Must equal MAGIC.
-    uint8_t  version;         ///< FORMAT_VERSION.
-    uint64_t total_data_bytes;///< Original (unencoded) file size in bytes.
-    Encoding encoding;        ///< Encoding scheme used.
-    uint32_t fps;             ///< Frames per second of the output video.
-    uint32_t cell_size;       ///< Visual cell size in pixels.
-    uint32_t rs_nsym;         ///< Reed-Solomon parity bytes per frame.
-    uint32_t payload_bytes_per_frame; ///< Payload bytes per data frame.
-    uint32_t cells_per_row;   ///< Number of data cells per row used to render frames.
-    uint32_t total_frames;    ///< Total number of data frames that follow.
+    uint32_t magic;           ///< 必须等于 MAGIC。
+    uint8_t  version;         ///< FORMAT_VERSION。
+    uint64_t total_data_bytes;///< 原始（未编码）文件总字节数。
+    Encoding encoding;        ///< 使用的编码方案。
+    uint32_t fps;             ///< 输出视频帧率。
+    uint32_t cell_size;       ///< 可视化单元格像素大小。
+    uint32_t rs_nsym;         ///< 每帧 Reed-Solomon 冗余字节数。
+    uint32_t payload_bytes_per_frame; ///< 每个数据帧的载荷字节数。
+    uint32_t cells_per_row;   ///< 渲染时每行数据单元格数量。
+    uint32_t total_frames;    ///< 后续总数据帧数。
 };
 
 } // namespace camcom

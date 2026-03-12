@@ -7,24 +7,14 @@
             "inheritEnvironments": [ "msvc_x64_x64" ],
             "buildRoot": "${projectDir}\\out\\build\\${name}",
             "installRoot": "${projectDir}\\out\\install\\${name}",
-            "cmakeCommandArgs": "-DOpenCV_DIR=\"D:/vscode/light/opencv/build/x64/vc16/lib\"",
+            "cmakeCommandArgs": "",
             "buildCommandArgs": "",
             "ctestCommandArgs": "",
             "variables": [
                 {
-                    "name": "AVCODEC_LIBRARIES",
-                    "value": "D:\\vscode\\light\\ffmpeg-master-latest-win64-gpl-shared\\ffmpeg-master-latest-win64-gpl-shared\\lib\\avcodec.lib",
-                    "type": "STRING"
-                },
-                {
-                    "name": "AVFORMAT_LIBRARIES",
-                    "value": "D:\\vscode\\light\\ffmpeg-master-latest-win64-gpl-shared\\ffmpeg-master-latest-win64-gpl-shared\\lib\\avformat.lib",
-                    "type": "STRING"
-                },
-                {
-                    "name": "AVUTIL_LIBRARIES",
-                    "value": "D:\\vscode\\light\\ffmpeg-master-latest-win64-gpl-shared\\ffmpeg-master-latest-win64-gpl-shared\\lib\\avutil.lib",
-                    "type": "STRING"
+                    "name": "OpenCV_DIR",
+                    "value": "${env.OPENCV_DIR}",
+                    "type": "PATH"
                 }
             ]
         },
@@ -34,25 +24,15 @@
             "configurationType": "Release",
             "buildRoot": "${projectDir}\\out\\build\\${name}",
             "installRoot": "${projectDir}\\out\\install\\${name}",
-            "cmakeCommandArgs": "-DOpenCV_DIR=\"D:/vscode/light/opencv/build/x64/vc16/lib\"",
+            "cmakeCommandArgs": "",
             "buildCommandArgs": "",
             "ctestCommandArgs": "",
             "inheritEnvironments": [ "msvc_x64_x64" ],
             "variables": [
                 {
-                    "name": "AVCODEC_LIBRARIES",
-                    "value": "D:\\vscode\\light\\ffmpeg-master-latest-win64-gpl-shared\\ffmpeg-master-latest-win64-gpl-shared\\lib\\avcodec.lib",
-                    "type": "STRING"
-                },
-                {
-                    "name": "AVFORMAT_LIBRARIES",
-                    "value": "D:\\vscode\\light\\ffmpeg-master-latest-win64-gpl-shared\\ffmpeg-master-latest-win64-gpl-shared\\lib\\avformat.lib",
-                    "type": "STRING"
-                },
-                {
-                    "name": "AVUTIL_LIBRARIES",
-                    "value": "D:\\vscode\\light\\ffmpeg-master-latest-win64-gpl-shared\\ffmpeg-master-latest-win64-gpl-shared\\lib\\avutil.lib",
-                    "type": "STRING"
+                    "name": "OpenCV_DIR",
+                    "value": "${env.OPENCV_DIR}",
+                    "type": "PATH"
                 }
             ]
         }

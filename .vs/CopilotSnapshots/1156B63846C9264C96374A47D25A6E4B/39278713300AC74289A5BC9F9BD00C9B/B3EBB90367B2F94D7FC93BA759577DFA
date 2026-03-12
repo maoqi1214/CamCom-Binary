@@ -1,0 +1,72 @@
+﻿#pragma once
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+// ---------------------------------------------------------------------------
+// 项目级常量
+// ---------------------------------------------------------------------------
+
+namespace camcom {
+
+/// 每段编码流开头写入的魔术字。
+constexpr uint32_t MAGIC = 0x43414D43; // "CAMC"
+
+/// 当前文件格式版本。
+constexpr uint8_t FORMAT_VERSION = 1;
+
+/// 编码输出视频的默认帧率。
+constexpr int DEFAULT_FPS = 30;
+
+/// 数据单元格大小（像素，宽高相等）。
+constexpr int DEFAULT_CELL_SIZE = 20;
+
+// ---------------------------------------------------------------------------
+// 共享类型与枚举
+// ---------------------------------------------------------------------------
+
+/// 编码器与解码器共用退出码。
+enum class ExitCode : int {
+    Ok              = 0,
+    BadArgs         = 1,
+    IoError         = 2,
+    EncodingError   = 3,
+    DecodingError   = 4,
+};
+
+/// 将字节映射为视觉符号时使用的编码方案。
+enum class Encoding : uint8_t {
+    Binary = 0, ///< 纯黑白像素块。
+    Gray4  = 1, ///< 四级灰度（每格 2 bit）。
+    // TODO: 按需扩展更多编码模式
+};
+
+/// 对给定字节范围计算 CRC-32（ISO 3309 多项式）。
+uint32_t crc32(const uint8_t* data, std::size_t length);
+
+/// 视频流中每帧携带的帧头。
+struct FrameHeader {
+    uint32_t magic;          ///< 必须等于 MAGIC。
+    uint8_t  version;        ///< FORMAT_VERSION。
+    uint32_t frame_index;    ///< 从 0 开始的帧序号。
+    uint32_t total_frames;   ///< 当前流中的总数据帧数。
+    uint32_t payload_bytes;  ///< 当前帧携带的数据字节数。
+    uint32_t checksum;       ///< 当前帧载荷字节的 CRC-32。
+};
+
+/// 顶层流头（在首帧开始处写入一次）。
+struct StreamHeader {
+    uint32_t magic;           ///< 必须等于 MAGIC。
+    uint8_t  version;         ///< FORMAT_VERSION。
+    uint64_t total_data_bytes;///< 原始（未编码）文件总字节数。
+    Encoding encoding;        ///< 使用的编码方案。
+    uint32_t fps;             ///< 输出视频帧率。
+    uint32_t cell_size;       ///< 可视化单元格像素大小。
+    uint32_t rs_nsym;         ///< 每帧 Reed-Solomon 冗余字节数。
+    uint32_t payload_bytes_per_frame; ///< 每个数据帧的载荷字节数。
+    uint32_t cells_per_row;   ///< 渲染时每行数据单元格数量。
+    uint32_t total_frames;    ///< 后续总数据帧数。
+};
+
+} // namespace camcom

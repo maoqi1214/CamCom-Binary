@@ -197,7 +197,7 @@ static bool try_parse_data_frame(const std::vector<uint8_t>& sample, uint32_t st
         }
     }
 
-    // Fast fallback: scan raw header candidates first, then decode only matching codeword length.
+    // 快速回退：先扫描原始帧头候选，再按匹配长度执行 RS 解码。
     const size_t min_codeword_len = kFrameHeaderBytes + static_cast<size_t>(stream_rs_nsym);
     for (size_t off = 0; off + min_codeword_len <= sample.size(); ++off) {
         const uint8_t* raw = sample.data() + static_cast<std::ptrdiff_t>(off);
@@ -370,7 +370,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // reassemble
+    // 重组输出数据
     std::vector<uint8_t> recovered;
 
     if (expected_total_frames == 0) {
@@ -398,9 +398,9 @@ int main(int argc, char* argv[]) {
                 current_size += frame_payload_size;
             }
             else {
-                // missing frame -> insert zeros
+                // 缺失帧：使用 0 填充
                 std::cerr << "Warning: missing frame " << i << "\n";
-                // Estimate size for missing frame
+                // 估算缺失帧应填充的字节数
                 size_t pad_size = static_cast<size_t>(cfg.payload_bytes_per_frame);
                 if (expected_total_bytes > 0 && i == expected_total_frames - 1) {
                     uint64_t remaining = (expected_total_bytes > current_size) ? expected_total_bytes - current_size : 0;
@@ -419,7 +419,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // write output
+    // 写出解码结果
     try {
         std::cout << "[decoder] Writing output file: " << output_path << "\n";
         write_binary_file(output_path, recovered);

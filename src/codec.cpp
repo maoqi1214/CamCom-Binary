@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace camcom {
 
@@ -14,7 +15,7 @@ namespace camcom {
     }
 
     void render_frame(cv::Mat& out, const std::vector<uint8_t>& payload, const EncoderConfig& cfg) {
-        // Convert payload bytes into 2-bit cells (MSB first within each byte)
+        // 将载荷字节转换为 2-bit 单元（每字节内按高位优先）
         std::vector<int> cells;
         cells.reserve(payload.size() * 4);
         for (uint8_t b : payload) {
@@ -29,7 +30,7 @@ namespace camcom {
         const int total_cells = static_cast<int>(cells.size());
         const int rows = (total_cells + cells_per_row - 1) / cells_per_row;
 
-        const int marker_cells = 4; // marker size in cells
+        const int marker_cells = FINDER_MARKER_CELLS; // 定位标记边长（按单元格计）
         const int marker_px = marker_cells * cfg.cell_size;
         const int data_w = cells_per_row * cfg.cell_size;
         const int data_h = rows * cfg.cell_size;
@@ -38,18 +39,18 @@ namespace camcom {
         const int img_h = data_h + marker_px * 2;
 
         out.create(img_h, img_w, CV_8UC3);
-        // background gray
+        // 背景填充为灰色
         out.setTo(cv::Scalar(128, 128, 128));
 
-        // draw corner finder markers (nested squares) in each corner
+        // 在四角绘制定位标记（同心方块）
         auto draw_finder = [&](int x, int y) {
             cv::Rect r(x, y, marker_px, marker_px);
-            // outer black
+            // 外层黑色
             cv::rectangle(out, r, cv::Scalar(0, 0, 0), cv::FILLED);
-            // inner white
+            // 内层白色
             int inner = cfg.cell_size;
             cv::rectangle(out, cv::Rect(x + inner, y + inner, marker_px - 2 * inner, marker_px - 2 * inner), cv::Scalar(255, 255, 255), cv::FILLED);
-            // central black
+            // 中心黑色
             int inner2 = inner * 2;
             cv::rectangle(out, cv::Rect(x + inner2, y + inner2, marker_px - 2 * inner2, marker_px - 2 * inner2), cv::Scalar(0, 0, 0), cv::FILLED);
             };
@@ -59,7 +60,21 @@ namespace camcom {
         draw_finder(0, img_h - marker_px);
         draw_finder(img_w - marker_px, img_h - marker_px);
 
-        // draw data cells: naturally fill canvas inside marker margins
+        // 在四条边中心增加辅助定位点，提升手机拍摄场景的鲁棒性。
+        const int small_marker_cells = 2;
+        const int small_marker_px = small_marker_cells * cfg.cell_size;
+        auto draw_small = [&](int x, int y) {
+            cv::Rect r(x, y, small_marker_px, small_marker_px);
+            cv::rectangle(out, r, cv::Scalar(0, 0, 0), cv::FILLED);
+            const int inner = std::max(1, cfg.cell_size / 2);
+            cv::rectangle(out, cv::Rect(x + inner, y + inner, small_marker_px - 2 * inner, small_marker_px - 2 * inner), cv::Scalar(255, 255, 255), cv::FILLED);
+        };
+        draw_small((img_w - small_marker_px) / 2, 0);
+        draw_small((img_w - small_marker_px) / 2, img_h - small_marker_px);
+        draw_small(0, (img_h - small_marker_px) / 2);
+        draw_small(img_w - small_marker_px, (img_h - small_marker_px) / 2);
+
+        // 绘制数据单元格：填充定位边距内的数据区域
         const int origin_x = marker_px;
         const int origin_y = marker_px;
 
@@ -73,12 +88,12 @@ namespace camcom {
             cv::rectangle(out, cell_rect, cfg.colors[v], cv::FILLED);
         }
 
-        // draw reference color blocks (inside top margin, near top-left)
+        // 绘制参考色块（顶部边距内，靠近左上）
         const int ref_cells = cfg.reference_block_size;
         const int ref_px = ref_cells * cfg.cell_size;
         int ref_origin_x = origin_x;
-        int ref_origin_y = origin_y - ref_px - cfg.cell_size; // just above data region
-        if (ref_origin_y < cfg.cell_size) ref_origin_y = origin_y; // fallback
+        int ref_origin_y = origin_y - ref_px - cfg.cell_size; // 位于数据区上方
+        if (ref_origin_y < cfg.cell_size) ref_origin_y = origin_y; // 回退处理
         for (int k = 0; k < 4; ++k) {
             int rx = ref_origin_x + k * (ref_px + cfg.cell_size / 2);
             cv::Rect r(rx, ref_origin_y, ref_px, ref_px);
@@ -115,17 +130,35 @@ namespace camcom {
 
         if (candidates.size() < 4) return false;
         std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) { return a.area > b.area; });
-        candidates.resize(4);
+        if (candidates.size() > 16) candidates.resize(16);
 
-        std::vector<cv::Point2f> pts;
-        pts.reserve(4);
-        for (const auto& c : candidates) pts.push_back(c.center);
+        auto pick_unique = [&](bool find_max, auto score_fn, std::vector<int>& used) {
+            int best_i = -1;
+            double best = find_max ? -std::numeric_limits<double>::infinity() : std::numeric_limits<double>::infinity();
+            for (int i = 0; i < static_cast<int>(candidates.size()); ++i) {
+                if (std::find(used.begin(), used.end(), i) != used.end()) continue;
+                const auto& p = candidates[i].center;
+                double s = score_fn(p);
+                if ((find_max && s > best) || (!find_max && s < best)) {
+                    best = s;
+                    best_i = i;
+                }
+            }
+            if (best_i >= 0) used.push_back(best_i);
+            return best_i;
+        };
 
-        // order: top-left, top-right, bottom-left, bottom-right
-        std::sort(pts.begin(), pts.end(), [](const cv::Point2f& a, const cv::Point2f& b) { return a.y == b.y ? a.x < b.x : a.y < b.y; });
-        cv::Point2f tl = pts[0], tr = pts[1], bl = pts[2], br = pts[3];
-        if (tr.x < tl.x) std::swap(tr, tl);
-        if (br.x < bl.x) std::swap(br, bl);
+        std::vector<int> used;
+        int tl_i = pick_unique(false, [](const cv::Point2f& p) { return static_cast<double>(p.x + p.y); }, used);
+        int br_i = pick_unique(true,  [](const cv::Point2f& p) { return static_cast<double>(p.x + p.y); }, used);
+        int tr_i = pick_unique(true,  [](const cv::Point2f& p) { return static_cast<double>(p.x - p.y); }, used);
+        int bl_i = pick_unique(false, [](const cv::Point2f& p) { return static_cast<double>(p.x - p.y); }, used);
+        if (tl_i < 0 || tr_i < 0 || bl_i < 0 || br_i < 0) return false;
+
+        cv::Point2f tl = candidates[tl_i].center;
+        cv::Point2f tr = candidates[tr_i].center;
+        cv::Point2f bl = candidates[bl_i].center;
+        cv::Point2f br = candidates[br_i].center;
 
         double w1 = cv::norm(tr - tl);
         double w2 = cv::norm(br - bl);
@@ -166,15 +199,15 @@ namespace camcom {
             int rows = 0;
 
             if (std::string(label) == "warped") {
-                cell_w = static_cast<double>(img_w) / (cfg.cells_per_row + 4);
-                cell_h = cell_w; // Assuming square cells
-                origin_x = static_cast<int>(std::round(2 * cell_w));
-                origin_y = static_cast<int>(std::round(2 * cell_h));
-                rows = static_cast<int>(std::round(img_h / cell_h)) - 4;
-            } else if (std::string(label) == "raw" && img_w == (cfg.cells_per_row + 8) * cfg.cell_size) {
-                origin_x = 4 * cfg.cell_size;
-                origin_y = 4 * cfg.cell_size;
-                rows = (img_h - 8 * cfg.cell_size) / cfg.cell_size;
+                cell_w = static_cast<double>(img_w) / (cfg.cells_per_row + FINDER_MARKER_CELLS);
+                cell_h = cell_w; // 假设单元格为正方形
+                origin_x = static_cast<int>(std::round((FINDER_MARKER_CELLS / 2.0) * cell_w));
+                origin_y = static_cast<int>(std::round((FINDER_MARKER_CELLS / 2.0) * cell_h));
+                rows = static_cast<int>(std::round(img_h / cell_h)) - FINDER_MARKER_CELLS;
+            } else if (std::string(label) == "raw" && img_w == (cfg.cells_per_row + 2 * FINDER_MARKER_CELLS) * cfg.cell_size) {
+                origin_x = FINDER_MARKER_CELLS * cfg.cell_size;
+                origin_y = FINDER_MARKER_CELLS * cfg.cell_size;
+                rows = (img_h - 2 * FINDER_MARKER_CELLS * cfg.cell_size) / cfg.cell_size;
             } else {
                 cv::Mat gray;
                 if (aligned.channels() == 3) cv::cvtColor(aligned, gray, cv::COLOR_BGR2GRAY); else gray = aligned;
@@ -205,7 +238,7 @@ namespace camcom {
                 auto [col_lo, col_hi] = find_band(col_std, 0.3);
 
                 if (row_lo == -1 || col_lo == -1) {
-                    std::cout << "[decoder] sample_frame(" << label << ") no variance band found\n";
+                    std::cout << "[decoder] sample_frame(" << label << ") 未找到有效方差带\n";
                     return false;
                 }
 
@@ -219,7 +252,7 @@ namespace camcom {
             }
 
             if (rows <= 0) {
-                std::cout << "[decoder] sample_frame(" << label << ") rows <= 0\n";
+                    std::cout << "[decoder] sample_frame(" << label << ") 行数 <= 0\n";
                 return false;
             }
 
@@ -235,7 +268,7 @@ namespace camcom {
                     int cell_px_h = static_cast<int>(std::round(cell_h));
 
                     if (x + cell_px_w > img_w || y + cell_px_h > img_h) {
-                        std::cout << "[decoder] sample_frame(" << label << ") cell out of bounds\n";
+                        std::cout << "[decoder] sample_frame(" << label << ") 单元格越界\n";
                         return false;
                     }
 
@@ -269,23 +302,23 @@ namespace camcom {
             return true;
         };
 
-                    // try raw first since tests use exact matching images
-                    if (sample_aligned(frame, "raw")) return true;
+        // 先尝试 raw 路径（测试场景通常为严格对齐图像）
+        if (sample_aligned(frame, "raw")) return true;
 
-                    cv::Mat warped;
-                    if (warp_with_finders(frame, warped)) {
-                        if (sample_aligned(warped, "warped")) return true;
-                        std::cout << "[decoder] sample_frame: warped sampling failed, trying raw\n";
-                    } else {
-                        std::cout << "[decoder] warp_with_finders failed, trying raw\n";
-                    }
+        cv::Mat warped;
+        if (warp_with_finders(frame, warped)) {
+            if (sample_aligned(warped, "warped")) return true;
+            std::cout << "[decoder] sample_frame: 透视矫正采样失败，尝试 raw\n";
+        } else {
+            std::cout << "[decoder] warp_with_finders 失败，尝试 raw\n";
+        }
 
-                    // fallback 1: center-crop square then sample
-                    cv::Mat cropped = center_crop_square(frame);
-                    if (sample_aligned(cropped, "cropped")) return true;
+        // 回退方案：先中心裁剪为正方形后再采样
+        cv::Mat cropped = center_crop_square(frame);
+        if (sample_aligned(cropped, "cropped")) return true;
 
-                    return false;
-                }
+        return false;
+    }
 
     double laplacian_variance(const cv::Mat& img) {
         cv::Mat gray;
@@ -300,7 +333,7 @@ namespace camcom {
     }
 
     cv::Vec3d compute_color_scale(const std::array<cv::Scalar, 4>& expected, const std::array<cv::Scalar, 4>& observed) {
-        // compute per-channel scale as average of observed/expected per color, avoid division by zero
+        // 计算每个通道的缩放系数：按颜色的观测值/期望值取平均，并避免除零
         double sb = 0, sg = 0, sr = 0; int cnt = 0;
         for (int i = 0; i < 4; ++i) {
             const cv::Scalar& e = expected[i];
