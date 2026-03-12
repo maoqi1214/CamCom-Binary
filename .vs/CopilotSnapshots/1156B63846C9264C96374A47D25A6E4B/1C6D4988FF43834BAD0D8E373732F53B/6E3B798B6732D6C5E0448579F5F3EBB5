@@ -1,0 +1,432 @@
+﻿#include "common.hpp"
+#include "io.hpp"
+#include "codec.hpp"
+#include "rs.hpp"
+
+#include <opencv2/opencv.hpp>
+
+#include <cstdlib>
+#include <iostream>
+#include <string>
+#include <vector>
+#include <optional>
+#include <algorithm>
+#include <unordered_map>
+#include <filesystem>
+
+using namespace camcom;
+namespace fs = std::filesystem;
+
+static void print_usage(const char* argv0) {
+    std::cerr
+        << "Usage: " << argv0 << " <input.mp4> <output.bin> [validity_mask.bin]\n"
+        << "\n"
+        << "  input.mp4          Path to the video file to decode.\n"
+        << "  output.bin         Path where the decoded binary data will be written.\n"
+        << "  validity_mask.bin  (Optional) Path to write the per-byte validity mask.\n"
+        << "\n"
+        << "Example:\n"
+        << "  " << argv0 << " input.mp4 output.bin mask.bin\n";
+}
+
+static uint32_t read_u32_le(const uint8_t* p) {
+    return static_cast<uint32_t>(p[0]) |
+        (static_cast<uint32_t>(p[1]) << 8) |
+        (static_cast<uint32_t>(p[2]) << 16) |
+        (static_cast<uint32_t>(p[3]) << 24);
+}
+
+static uint64_t read_u64_le(const uint8_t* p) {
+    uint64_t value = 0;
+    for (int i = 0; i < 8; ++i) {
+        value |= static_cast<uint64_t>(p[i]) << (8 * i);
+    }
+    return value;
+}
+
+static bool is_black_frame(const cv::Mat& frame) {
+    cv::Scalar mean = cv::mean(frame);
+    return mean[0] < 5 && mean[1] < 5 && mean[2] < 5;
+}
+
+static bool decode_rs(std::vector<uint8_t>& codeword, uint32_t nsym) {
+    if (nsym == 0) {
+        return true;
+    }
+    return rs::decode(codeword, static_cast<int>(nsym));
+}
+
+static bool try_parse_bootstrap(const std::vector<uint8_t>& sample, EncoderConfig& cfg, uint32_t& stream_rs_nsym) {
+    constexpr size_t kBootstrapBytes = 4 + 1 + 6 * 4;
+    if (sample.size() < kBootstrapBytes) {
+        return false;
+    }
+
+    for (size_t off = 0; off + kBootstrapBytes <= sample.size(); ++off) {
+        const uint8_t* p = sample.data() + static_cast<std::ptrdiff_t>(off);
+        uint32_t magic = read_u32_le(p); p += 4;
+        uint8_t version = *p; p += 1;
+        if (magic != MAGIC || version != FORMAT_VERSION) {
+            continue;
+        }
+
+        uint32_t rs_nsym = read_u32_le(p); p += 4;
+        uint32_t cell_size = read_u32_le(p); p += 4;
+        uint32_t cells_per_row = read_u32_le(p); p += 4;
+        uint32_t payload_per = read_u32_le(p); p += 4;
+        uint32_t fps = read_u32_le(p); p += 4;
+        uint32_t reference_block_size = read_u32_le(p); p += 4;
+
+        if (cell_size == 0 || cells_per_row == 0 || payload_per == 0 || fps == 0 || rs_nsym > 255 || reference_block_size == 0) {
+            continue;
+        }
+
+        cfg.cell_size = static_cast<int>(cell_size);
+        cfg.fps = static_cast<int>(fps);
+        cfg.payload_bytes_per_frame = static_cast<int>(payload_per);
+        cfg.cells_per_row = static_cast<int>(cells_per_row);
+        cfg.rs_nsym = static_cast<int>(rs_nsym);
+        cfg.reference_block_size = static_cast<int>(reference_block_size);
+        stream_rs_nsym = rs_nsym;
+        return true;
+    }
+
+    return false;
+}
+
+static bool try_parse_stream_header(const std::vector<uint8_t>& sample, uint32_t& stream_rs_nsym, EncoderConfig& cfg, uint32_t& expected_total_frames, uint64_t& expected_total_bytes) {
+    constexpr size_t kStreamHeaderBytes = 4 + 1 + 8 + 1 + 6 * 4;
+    const size_t codeword_len = kStreamHeaderBytes + static_cast<size_t>(stream_rs_nsym);
+    if (sample.size() < codeword_len) {
+        return false;
+    }
+
+    for (size_t off = 0; off + codeword_len <= sample.size(); ++off) {
+        std::vector<uint8_t> codeword(
+            sample.begin() + static_cast<std::ptrdiff_t>(off),
+            sample.begin() + static_cast<std::ptrdiff_t>(off + codeword_len));
+        if (!decode_rs(codeword, stream_rs_nsym)) {
+            continue;
+        }
+
+        const uint8_t* p = codeword.data();
+        uint32_t magic = read_u32_le(p); p += 4;
+        uint8_t version = *p; p += 1;
+        if (magic != MAGIC || version != FORMAT_VERSION) {
+            continue;
+        }
+
+        uint64_t total_data = read_u64_le(p); p += 8;
+        uint8_t encoding = *p; p += 1;
+        (void)encoding;
+        uint32_t fps = read_u32_le(p); p += 4;
+        uint32_t cell_size = read_u32_le(p); p += 4;
+        uint32_t rs_nsym = read_u32_le(p); p += 4;
+        uint32_t payload_per = read_u32_le(p); p += 4;
+        uint32_t cells_per_row = read_u32_le(p); p += 4;
+        uint32_t total_frames_hdr = read_u32_le(p); p += 4;
+
+        if (cell_size == 0 || payload_per == 0 || cells_per_row == 0 || total_frames_hdr == 0 || rs_nsym > 255) {
+            continue;
+        }
+
+        cfg.cell_size = static_cast<int>(cell_size);
+        cfg.fps = static_cast<int>(fps);
+        cfg.payload_bytes_per_frame = static_cast<int>(payload_per);
+        cfg.cells_per_row = static_cast<int>(cells_per_row);
+        cfg.rs_nsym = static_cast<int>(rs_nsym);
+        stream_rs_nsym = rs_nsym;
+        expected_total_frames = total_frames_hdr;
+        expected_total_bytes = total_data;
+        return true;
+    }
+
+    return false;
+}
+
+static bool try_parse_data_frame(const std::vector<uint8_t>& sample, uint32_t stream_rs_nsym, const EncoderConfig& cfg, FrameHeader& hdr, std::vector<uint8_t>& payload_out) {
+    constexpr size_t kFrameHeaderBytes = 4 + 1 + 4 + 4 + 4 + 4;
+    if (sample.size() < kFrameHeaderBytes + static_cast<size_t>(stream_rs_nsym)) {
+        return false;
+    }
+
+    const size_t full_payload_codeword = kFrameHeaderBytes + static_cast<size_t>(cfg.payload_bytes_per_frame) + static_cast<size_t>(stream_rs_nsym);
+    if (cfg.payload_bytes_per_frame > 0 && sample.size() >= full_payload_codeword) {
+        for (size_t off = 0; off + full_payload_codeword <= sample.size(); ++off) {
+            std::vector<uint8_t> codeword(
+                sample.begin() + static_cast<std::ptrdiff_t>(off),
+                sample.begin() + static_cast<std::ptrdiff_t>(off + full_payload_codeword));
+            if (!decode_rs(codeword, stream_rs_nsym)) {
+                continue;
+            }
+
+            const uint8_t* p = codeword.data();
+            FrameHeader local{};
+            local.magic = read_u32_le(p); p += 4;
+            local.version = *p; p += 1;
+            local.frame_index = read_u32_le(p); p += 4;
+            local.total_frames = read_u32_le(p); p += 4;
+            local.payload_bytes = read_u32_le(p); p += 4;
+            local.checksum = read_u32_le(p); p += 4;
+
+            if (local.magic != MAGIC || local.version != FORMAT_VERSION) {
+                continue;
+            }
+            if (local.total_frames == 0 || local.frame_index >= local.total_frames) {
+                continue;
+            }
+            if (local.payload_bytes == 0 || local.payload_bytes > static_cast<uint32_t>(cfg.payload_bytes_per_frame)) {
+                continue;
+            }
+
+            const size_t payload_len = static_cast<size_t>(local.payload_bytes);
+            if (p + payload_len > codeword.data() + codeword.size()) {
+                continue;
+            }
+
+            const uint32_t calc = crc32(p, payload_len);
+            if (calc != local.checksum) {
+                continue;
+            }
+
+            hdr = local;
+            payload_out.assign(p, p + payload_len);
+            return true;
+        }
+    }
+
+    const size_t min_codeword_len = kFrameHeaderBytes + static_cast<size_t>(stream_rs_nsym);
+    for (size_t off = 0; off + min_codeword_len <= sample.size(); ++off) {
+        const size_t max_codeword_len = sample.size() - off;
+        for (size_t codeword_len = max_codeword_len; codeword_len >= min_codeword_len; --codeword_len) {
+            std::vector<uint8_t> codeword(
+                sample.begin() + static_cast<std::ptrdiff_t>(off),
+                sample.begin() + static_cast<std::ptrdiff_t>(off + codeword_len));
+            if (!decode_rs(codeword, stream_rs_nsym)) {
+                continue;
+            }
+
+            const uint8_t* p = codeword.data();
+            FrameHeader local{};
+            local.magic = read_u32_le(p); p += 4;
+            local.version = *p; p += 1;
+            local.frame_index = read_u32_le(p); p += 4;
+            local.total_frames = read_u32_le(p); p += 4;
+            local.payload_bytes = read_u32_le(p); p += 4;
+            local.checksum = read_u32_le(p); p += 4;
+
+            if (local.magic != MAGIC || local.version != FORMAT_VERSION) {
+                continue;
+            }
+            if (local.total_frames == 0 || local.frame_index >= local.total_frames) {
+                continue;
+            }
+
+            const size_t payload_len = static_cast<size_t>(local.payload_bytes);
+            const size_t expected_codeword_len = kFrameHeaderBytes + payload_len + static_cast<size_t>(stream_rs_nsym);
+            if (expected_codeword_len != codeword_len) {
+                continue;
+            }
+            if (p + payload_len > codeword.data() + codeword.size()) {
+                continue;
+            }
+
+            const uint32_t calc = crc32(p, payload_len);
+            if (calc != local.checksum) {
+                continue;
+            }
+
+            hdr = local;
+            payload_out.assign(p, p + payload_len);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+int main(int argc, char* argv[]) {
+    std::cout << "[decoder] Starting...\n";
+    std::cout << "[decoder] argc: " << argc << "\n";
+    for (int i = 0; i < argc; ++i) {
+        std::cout << "[decoder] argv[" << i << "]: " << argv[i] << "\n";
+    }
+
+    if (argc < 3 || argc > 4) {
+        print_usage(argv[0]);
+        return static_cast<int>(ExitCode::BadArgs);
+    }
+
+    const std::string video_path = argv[1];
+    const std::string output_path = argv[2];
+    const std::string mask_path = (argc == 4) ? argv[3] : "";
+
+    std::cout << "[decoder] Input video: " << video_path << "\n";
+    std::cout << "[decoder] Output file: " << output_path << "\n";
+    if (!mask_path.empty()) {
+        std::cout << "[decoder] Mask file  : " << mask_path << "\n";
+    }
+
+    if (!file_exists(video_path)) {
+        std::cerr << "Error: video file not found: " << video_path << "\n";
+        return static_cast<int>(ExitCode::IoError);
+    }
+    std::cout << "[decoder] Video file exists\n";
+
+    EncoderConfig cfg;
+
+    const std::string temp_dir = "temp_frames_dec";
+    if (fs::exists(temp_dir)) {
+        fs::remove_all(temp_dir);
+    }
+    fs::create_directory(temp_dir);
+
+    std::string ffmpeg_cmd = "ffmpeg -y -i " + video_path + " " + temp_dir + "/frame_%d.png";
+    std::cout << "[decoder] Running ffmpeg command: " << ffmpeg_cmd << "\n";
+    int ffmpeg_result = system(ffmpeg_cmd.c_str());
+    if (ffmpeg_result != 0) {
+        std::cerr << "Error: ffmpeg command failed to extract frames.\n";
+        fs::remove_all(temp_dir);
+        return static_cast<int>(ExitCode::DecodingError);
+    }
+
+    std::unordered_map<uint32_t, std::vector<uint8_t>> frames_buffer;
+    uint32_t expected_total_frames = 0;
+    uint64_t expected_total_bytes = 0;
+    bool have_bootstrap = false;
+    bool have_stream_header = false;
+
+    uint32_t stream_rs_nsym = 0;
+
+    int frame_count = 1;
+    while (true) {
+        std::string frame_file = temp_dir + "/frame_" + std::to_string(frame_count) + ".png";
+        if (!fs::exists(frame_file)) {
+            break;
+        }
+
+        cv::Mat frame = cv::imread(frame_file, cv::IMREAD_COLOR);
+        if (frame.empty()) {
+            frame_count++;
+            continue;
+        }
+
+        std::cout << "[decoder] Processing frame " << frame_count << "\n";
+        frame_count++;
+
+        if (is_black_frame(frame)) {
+            continue;
+        }
+
+        std::vector<uint8_t> sample;
+        if (!sample_frame(frame, sample, cfg)) {
+            std::cout << "[decoder] Failed to sample frame\n";
+            continue;
+        }
+
+        if (!have_bootstrap) {
+            if (try_parse_bootstrap(sample, cfg, stream_rs_nsym)) {
+                have_bootstrap = true;
+                std::cout << "[decoder] Found bootstrap frame with config: cell_size=" << cfg.cell_size << ", cells_per_row=" << cfg.cells_per_row << "\n";
+            }
+            continue;
+        }
+
+        if (!have_stream_header) {
+            if (try_parse_stream_header(sample, stream_rs_nsym, cfg, expected_total_frames, expected_total_bytes)) {
+                have_stream_header = true;
+                std::cout << "[decoder] Found stream header: total_frames=" << expected_total_frames << ", total_bytes=" << expected_total_bytes << "\n";
+            }
+        }
+
+        FrameHeader hdr{};
+        std::vector<uint8_t> payload;
+        if (!try_parse_data_frame(sample, stream_rs_nsym, cfg, hdr, payload)) {
+            continue;
+        }
+
+        if (hdr.total_frames > 0 && expected_total_frames == 0) {
+            expected_total_frames = hdr.total_frames;
+        }
+
+        auto it = frames_buffer.find(hdr.frame_index);
+        if (it == frames_buffer.end() || it->second.empty()) {
+            frames_buffer[hdr.frame_index] = std::move(payload);
+            std::cout << "[decoder] Decoded frame " << hdr.frame_index << " of " << hdr.total_frames << "\n";
+        }
+    }
+
+    // reassemble
+    std::vector<uint8_t> recovered;
+    std::vector<uint8_t> mask;
+
+    if (expected_total_frames == 0) {
+        if (!frames_buffer.empty()) {
+            uint32_t max_index = 0;
+            for (const auto& kv : frames_buffer) {
+                max_index = std::max(max_index, kv.first);
+            }
+            expected_total_frames = max_index + 1;
+        }
+    }
+
+    if (expected_total_frames == 0) {
+        std::cerr << "Warning: no frames decoded successfully." << std::endl;
+    }
+    else {
+        uint64_t current_size = 0;
+        for (uint32_t i = 0; i < expected_total_frames; ++i) {
+            auto it = frames_buffer.find(i);
+            size_t frame_payload_size = 0;
+
+            if (it != frames_buffer.end() && !it->second.empty()) {
+                frame_payload_size = it->second.size();
+                recovered.insert(recovered.end(), it->second.begin(), it->second.end());
+                mask.insert(mask.end(), frame_payload_size, 0x01);
+                current_size += frame_payload_size;
+            }
+            else {
+                // missing frame -> insert zeros
+                std::cerr << "Warning: missing frame " << i << "\n";
+                // Estimate size for missing frame
+                size_t pad_size = static_cast<size_t>(cfg.payload_bytes_per_frame);
+                if (expected_total_bytes > 0 && i == expected_total_frames - 1) {
+                    uint64_t remaining = (expected_total_bytes > current_size) ? expected_total_bytes - current_size : 0;
+                    pad_size = static_cast<size_t>(std::min(static_cast<uint64_t>(pad_size), remaining));
+                } else if (expected_total_bytes > 0 && current_size + pad_size > expected_total_bytes) {
+                    pad_size = static_cast<size_t>(expected_total_bytes - current_size);
+                }
+
+                recovered.insert(recovered.end(), pad_size, 0x00);
+                mask.insert(mask.end(), pad_size, 0x00);
+                current_size += pad_size;
+            }
+        }
+
+        if (expected_total_bytes > 0 && recovered.size() > expected_total_bytes) {
+            recovered.resize(static_cast<size_t>(expected_total_bytes));
+            mask.resize(static_cast<size_t>(expected_total_bytes));
+        }
+    }
+
+    // write output
+    try {
+        std::cout << "[decoder] Writing output file: " << output_path << "\n";
+        write_binary_file(output_path, recovered);
+        std::cout << "[decoder] Output file written successfully\n";
+
+        if (!mask_path.empty()) {
+            std::cout << "[decoder] Writing mask file: " << mask_path << "\n";
+            write_binary_file(mask_path, mask);
+        }
+    }
+    catch (const std::exception& ex) {
+        std::cerr << "Error writing output: " << ex.what() << "\n";
+        fs::remove_all(temp_dir);
+        return static_cast<int>(ExitCode::IoError);
+    }
+
+    fs::remove_all(temp_dir);
+    std::cout << "[decoder] Done. Recovered bytes=" << recovered.size() << "\n";
+    return static_cast<int>(ExitCode::Ok);
+}

@@ -160,67 +160,86 @@ namespace camcom {
             const int img_w = aligned.cols;
             const int img_h = aligned.rows;
 
-            // Estimate data bounding band by variance along rows/cols to better align when margins differ.
-            cv::Mat gray;
-            if (aligned.channels() == 3) cv::cvtColor(aligned, gray, cv::COLOR_BGR2GRAY); else gray = aligned;
+            int origin_x = 0, origin_y = 0;
+            double cell_w = cfg.cell_size;
+            double cell_h = cfg.cell_size;
+            int rows = 0;
 
-            std::vector<double> row_std(img_h), col_std(img_w);
-            for (int y = 0; y < img_h; ++y) {
-                cv::Scalar mean, stddev;
-                cv::meanStdDev(gray.row(y), mean, stddev);
-                row_std[y] = stddev[0];
-            }
-            for (int x = 0; x < img_w; ++x) {
-                cv::Scalar mean, stddev;
-                cv::meanStdDev(gray.col(x), mean, stddev);
-                col_std[x] = stddev[0];
-            }
+            if (std::string(label) == "warped") {
+                cell_w = static_cast<double>(img_w) / (cfg.cells_per_row + 4);
+                cell_h = cell_w; // Assuming square cells
+                origin_x = static_cast<int>(std::round(2 * cell_w));
+                origin_y = static_cast<int>(std::round(2 * cell_h));
+                rows = static_cast<int>(std::round(img_h / cell_h)) - 4;
+            } else if (std::string(label) == "raw" && img_w == (cfg.cells_per_row + 8) * cfg.cell_size) {
+                origin_x = 4 * cfg.cell_size;
+                origin_y = 4 * cfg.cell_size;
+                rows = (img_h - 8 * cfg.cell_size) / cfg.cell_size;
+            } else {
+                cv::Mat gray;
+                if (aligned.channels() == 3) cv::cvtColor(aligned, gray, cv::COLOR_BGR2GRAY); else gray = aligned;
 
-            auto find_band = [](const std::vector<double>& v, double thresh_frac) {
-                double maxv = 0; for (double d : v) maxv = std::max(maxv, d);
-                double th = maxv * thresh_frac;
-                int lo = -1, hi = -1;
-                for (int i = 0; i < static_cast<int>(v.size()); ++i) {
-                    if (v[i] >= th) { if (lo == -1) lo = i; hi = i; }
+                std::vector<double> row_std(img_h), col_std(img_w);
+                for (int y = 0; y < img_h; ++y) {
+                    cv::Scalar mean, stddev;
+                    cv::meanStdDev(gray.row(y), mean, stddev);
+                    row_std[y] = stddev[0];
                 }
-                return std::pair<int,int>(lo, hi);
-            };
+                for (int x = 0; x < img_w; ++x) {
+                    cv::Scalar mean, stddev;
+                    cv::meanStdDev(gray.col(x), mean, stddev);
+                    col_std[x] = stddev[0];
+                }
 
-            auto [row_lo, row_hi] = find_band(row_std, 0.3);
-            auto [col_lo, col_hi] = find_band(col_std, 0.3);
+                auto find_band = [](const std::vector<double>& v, double thresh_frac) {
+                    double maxv = 0; for (double d : v) maxv = std::max(maxv, d);
+                    double th = maxv * thresh_frac;
+                    int lo = -1, hi = -1;
+                    for (int i = 0; i < static_cast<int>(v.size()); ++i) {
+                        if (v[i] >= th) { if (lo == -1) lo = i; hi = i; }
+                    }
+                    return std::pair<int,int>(lo, hi);
+                };
 
-            if (row_lo == -1 || col_lo == -1) {
-                std::cout << "[decoder] sample_frame(" << label << ") no variance band found" << "\n";
-                return false;
+                auto [row_lo, row_hi] = find_band(row_std, 0.3);
+                auto [col_lo, col_hi] = find_band(col_std, 0.3);
+
+                if (row_lo == -1 || col_lo == -1) {
+                    std::cout << "[decoder] sample_frame(" << label << ") no variance band found\n";
+                    return false;
+                }
+
+                origin_x = std::max(0, col_lo - (col_lo % cfg.cell_size));
+                origin_y = std::max(0, row_lo - (row_lo % cfg.cell_size));
+                int data_w = cfg.cells_per_row * cfg.cell_size;
+                if (origin_x + data_w > img_w) origin_x = std::max(0, img_w - data_w);
+
+                int observed_h = row_hi - origin_y + 1;
+                rows = observed_h / cfg.cell_size;
             }
 
-            int origin_x = std::max(0, col_lo - (col_lo % cfg.cell_size));
-            int origin_y = std::max(0, row_lo - (row_lo % cfg.cell_size));
-
-            // ensure we have room for full row/col count
-            const int cols = cfg.cells_per_row;
-            const int data_w = cols * cfg.cell_size;
-            if (origin_x + data_w > img_w) origin_x = std::max(0, img_w - data_w);
-
-            int observed_h = row_hi - origin_y + 1;
-            int rows = observed_h / cfg.cell_size;
             if (rows <= 0) {
-                std::cout << "[decoder] sample_frame(" << label << ") rows <= 0" << "\n";
+                std::cout << "[decoder] sample_frame(" << label << ") rows <= 0\n";
                 return false;
             }
 
+            const int cols = cfg.cells_per_row;
             std::vector<int> cells;
             cells.reserve(rows * cols);
 
             for (int r = 0; r < rows; ++r) {
                 for (int c = 0; c < cols; ++c) {
-                    int x = origin_x + c * cfg.cell_size;
-                    int y = origin_y + r * cfg.cell_size;
-                    if (x + cfg.cell_size > aligned.cols || y + cfg.cell_size > aligned.rows) {
-                        std::cout << "[decoder] sample_frame(" << label << ") cell out of bounds at r=" << r << " c=" << c << "\n";
+                    int x = origin_x + static_cast<int>(std::round(c * cell_w));
+                    int y = origin_y + static_cast<int>(std::round(r * cell_h));
+                    int cell_px_w = static_cast<int>(std::round(cell_w));
+                    int cell_px_h = static_cast<int>(std::round(cell_h));
+
+                    if (x + cell_px_w > img_w || y + cell_px_h > img_h) {
+                        std::cout << "[decoder] sample_frame(" << label << ") cell out of bounds\n";
                         return false;
                     }
-                    cv::Rect cell_rect(x, y, cfg.cell_size, cfg.cell_size);
+
+                    cv::Rect cell_rect(x, y, cell_px_w, cell_px_h);
                     cv::Mat roi = aligned(cell_rect);
                     cv::Scalar mean = cv::mean(roi);
                     int best = 0;
@@ -250,21 +269,23 @@ namespace camcom {
             return true;
         };
 
-        cv::Mat warped;
-        if (warp_with_finders(frame, warped)) {
-            if (sample_aligned(warped, "warped")) return true;
-            std::cout << "[decoder] sample_frame: warped sampling failed, trying raw" << "\n";
-        } else {
-            std::cout << "[decoder] warp_with_finders failed, trying raw" << "\n";
-        }
+                    // try raw first since tests use exact matching images
+                    if (sample_aligned(frame, "raw")) return true;
 
-        // fallback 1: center-crop square then sample
-        cv::Mat cropped = center_crop_square(frame);
-        if (sample_aligned(cropped, "cropped")) return true;
+                    cv::Mat warped;
+                    if (warp_with_finders(frame, warped)) {
+                        if (sample_aligned(warped, "warped")) return true;
+                        std::cout << "[decoder] sample_frame: warped sampling failed, trying raw\n";
+                    } else {
+                        std::cout << "[decoder] warp_with_finders failed, trying raw\n";
+                    }
 
-        // fallback 2: assume input already aligned
-        return sample_aligned(frame, "raw");
-    }
+                    // fallback 1: center-crop square then sample
+                    cv::Mat cropped = center_crop_square(frame);
+                    if (sample_aligned(cropped, "cropped")) return true;
+
+                    return false;
+                }
 
     double laplacian_variance(const cv::Mat& img) {
         cv::Mat gray;

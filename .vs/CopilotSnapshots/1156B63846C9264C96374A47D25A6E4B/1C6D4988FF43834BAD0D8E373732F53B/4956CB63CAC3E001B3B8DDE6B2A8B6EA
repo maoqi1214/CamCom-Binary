@@ -1,0 +1,311 @@
+﻿#include "codec.hpp"
+#include "common.hpp"
+
+#include <algorithm>
+#include <cmath>
+
+namespace camcom {
+
+    static inline int color_distance_sq(const cv::Scalar& a, const cv::Scalar& b) {
+        int db = static_cast<int>(a[0] - b[0]);
+        int dg = static_cast<int>(a[1] - b[1]);
+        int dr = static_cast<int>(a[2] - b[2]);
+        return db * db + dg * dg + dr * dr;
+    }
+
+    void render_frame(cv::Mat& out, const std::vector<uint8_t>& payload, const EncoderConfig& cfg) {
+        // Convert payload bytes into 2-bit cells (MSB first within each byte)
+        std::vector<int> cells;
+        cells.reserve(payload.size() * 4);
+        for (uint8_t b : payload) {
+            for (int i = 0; i < 4; ++i) {
+                int shift = 6 - 2 * i;
+                int v = (b >> shift) & 0x3;
+                cells.push_back(v);
+            }
+        }
+
+        const int cells_per_row = cfg.cells_per_row;
+        const int total_cells = static_cast<int>(cells.size());
+        const int rows = (total_cells + cells_per_row - 1) / cells_per_row;
+
+        const int marker_cells = 4; // marker size in cells
+        const int marker_px = marker_cells * cfg.cell_size;
+        const int data_w = cells_per_row * cfg.cell_size;
+        const int data_h = rows * cfg.cell_size;
+
+        const int img_w = data_w + marker_px * 2;
+        const int img_h = data_h + marker_px * 2;
+
+        out.create(img_h, img_w, CV_8UC3);
+        // background gray
+        out.setTo(cv::Scalar(128, 128, 128));
+
+        // draw corner finder markers (nested squares) in each corner
+        auto draw_finder = [&](int x, int y) {
+            cv::Rect r(x, y, marker_px, marker_px);
+            // outer black
+            cv::rectangle(out, r, cv::Scalar(0, 0, 0), cv::FILLED);
+            // inner white
+            int inner = cfg.cell_size;
+            cv::rectangle(out, cv::Rect(x + inner, y + inner, marker_px - 2 * inner, marker_px - 2 * inner), cv::Scalar(255, 255, 255), cv::FILLED);
+            // central black
+            int inner2 = inner * 2;
+            cv::rectangle(out, cv::Rect(x + inner2, y + inner2, marker_px - 2 * inner2, marker_px - 2 * inner2), cv::Scalar(0, 0, 0), cv::FILLED);
+            };
+
+        draw_finder(0, 0);
+        draw_finder(img_w - marker_px, 0);
+        draw_finder(0, img_h - marker_px);
+        draw_finder(img_w - marker_px, img_h - marker_px);
+
+        // draw data cells: naturally fill canvas inside marker margins
+        const int origin_x = marker_px;
+        const int origin_y = marker_px;
+
+        for (int idx = 0; idx < total_cells; ++idx) {
+            int r = idx / cells_per_row;
+            int c = idx % cells_per_row;
+            int x = origin_x + c * cfg.cell_size;
+            int y = origin_y + r * cfg.cell_size;
+            cv::Rect cell_rect(x, y, cfg.cell_size, cfg.cell_size);
+            int v = cells[idx];
+            cv::rectangle(out, cell_rect, cfg.colors[v], cv::FILLED);
+        }
+
+        // draw reference color blocks (inside top margin, near top-left)
+        const int ref_cells = cfg.reference_block_size;
+        const int ref_px = ref_cells * cfg.cell_size;
+        int ref_origin_x = origin_x;
+        int ref_origin_y = origin_y - ref_px - cfg.cell_size; // just above data region
+        if (ref_origin_y < cfg.cell_size) ref_origin_y = origin_y; // fallback
+        for (int k = 0; k < 4; ++k) {
+            int rx = ref_origin_x + k * (ref_px + cfg.cell_size / 2);
+            cv::Rect r(rx, ref_origin_y, ref_px, ref_px);
+            cv::rectangle(out, r, cfg.colors[k], cv::FILLED);
+        }
+    }
+
+    static bool warp_with_finders(const cv::Mat& src, cv::Mat& warped) {
+        cv::Mat gray;
+        if (src.channels() == 3) cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
+        else gray = src;
+        cv::GaussianBlur(gray, gray, cv::Size(5, 5), 0);
+        cv::Mat bin;
+        cv::threshold(gray, bin, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
+
+        std::vector<std::vector<cv::Point>> contours;
+        cv::findContours(bin, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+        struct Candidate { double area; std::vector<cv::Point> poly; cv::Point2f center; };
+        std::vector<Candidate> candidates;
+        for (const auto& c : contours) {
+            double area = cv::contourArea(c);
+            if (area < 100.0) continue;
+            std::vector<cv::Point> poly;
+            cv::approxPolyDP(c, poly, 0.05 * cv::arcLength(c, true), true);
+            if (poly.size() < 4) continue;
+            cv::Rect bounds = cv::boundingRect(poly);
+            double aspect = static_cast<double>(bounds.width) / std::max(1, bounds.height);
+            if (aspect < 0.7 || aspect > 1.3) continue;
+            cv::Moments m = cv::moments(poly);
+            cv::Point2f center(static_cast<float>(m.m10 / m.m00), static_cast<float>(m.m01 / m.m00));
+            candidates.push_back({ area, poly, center });
+        }
+
+        if (candidates.size() < 4) return false;
+        std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) { return a.area > b.area; });
+        candidates.resize(4);
+
+        std::vector<cv::Point2f> pts;
+        pts.reserve(4);
+        for (const auto& c : candidates) pts.push_back(c.center);
+
+        // order: top-left, top-right, bottom-left, bottom-right
+        std::sort(pts.begin(), pts.end(), [](const cv::Point2f& a, const cv::Point2f& b) { return a.y == b.y ? a.x < b.x : a.y < b.y; });
+        cv::Point2f tl = pts[0], tr = pts[1], bl = pts[2], br = pts[3];
+        if (tr.x < tl.x) std::swap(tr, tl);
+        if (br.x < bl.x) std::swap(br, bl);
+
+        double w1 = cv::norm(tr - tl);
+        double w2 = cv::norm(br - bl);
+        double h1 = cv::norm(bl - tl);
+        double h2 = cv::norm(br - tr);
+        double target = std::max({ w1, w2, h1, h2 });
+        if (target < 1.0) return false;
+        int dst_size = static_cast<int>(std::ceil(target));
+
+        std::vector<cv::Point2f> dst = {
+            cv::Point2f(0.f, 0.f),
+            cv::Point2f(static_cast<float>(dst_size - 1), 0.f),
+            cv::Point2f(0.f, static_cast<float>(dst_size - 1)),
+            cv::Point2f(static_cast<float>(dst_size - 1), static_cast<float>(dst_size - 1))
+        };
+
+        cv::Mat M = cv::getPerspectiveTransform(std::vector<cv::Point2f>{ tl, tr, bl, br }, dst);
+        cv::warpPerspective(src, warped, M, cv::Size(dst_size, dst_size));
+        return true;
+    }
+
+    static cv::Mat center_crop_square(const cv::Mat& src) {
+        int side = std::min(src.cols, src.rows);
+        int x = (src.cols - side) / 2;
+        int y = (src.rows - side) / 2;
+        cv::Rect roi(x, y, side, side);
+        return src(roi).clone();
+    }
+
+    bool sample_frame(const cv::Mat& frame, std::vector<uint8_t>& out_payload, const EncoderConfig& cfg) {
+        auto sample_aligned = [&](const cv::Mat& aligned, const char* label) -> bool {
+            const int img_w = aligned.cols;
+            const int img_h = aligned.rows;
+
+            int origin_x = 0, origin_y = 0;
+            double cell_w = cfg.cell_size;
+            double cell_h = cfg.cell_size;
+            int rows = 0;
+
+            if (std::string(label) == "warped") {
+                cell_w = static_cast<double>(img_w) / (cfg.cells_per_row + 4);
+                cell_h = cell_w; // Assuming square cells
+                origin_x = static_cast<int>(std::round(2 * cell_w));
+                origin_y = static_cast<int>(std::round(2 * cell_h));
+                rows = static_cast<int>(std::round(img_h / cell_h)) - 4;
+            } else {
+                cv::Mat gray;
+                if (aligned.channels() == 3) cv::cvtColor(aligned, gray, cv::COLOR_BGR2GRAY); else gray = aligned;
+
+                std::vector<double> row_std(img_h), col_std(img_w);
+                for (int y = 0; y < img_h; ++y) {
+                    cv::Scalar mean, stddev;
+                    cv::meanStdDev(gray.row(y), mean, stddev);
+                    row_std[y] = stddev[0];
+                }
+                for (int x = 0; x < img_w; ++x) {
+                    cv::Scalar mean, stddev;
+                    cv::meanStdDev(gray.col(x), mean, stddev);
+                    col_std[x] = stddev[0];
+                }
+
+                auto find_band = [](const std::vector<double>& v, double thresh_frac) {
+                    double maxv = 0; for (double d : v) maxv = std::max(maxv, d);
+                    double th = maxv * thresh_frac;
+                    int lo = -1, hi = -1;
+                    for (int i = 0; i < static_cast<int>(v.size()); ++i) {
+                        if (v[i] >= th) { if (lo == -1) lo = i; hi = i; }
+                    }
+                    return std::pair<int,int>(lo, hi);
+                };
+
+                auto [row_lo, row_hi] = find_band(row_std, 0.3);
+                auto [col_lo, col_hi] = find_band(col_std, 0.3);
+
+                if (row_lo == -1 || col_lo == -1) {
+                    std::cout << "[decoder] sample_frame(" << label << ") no variance band found\n";
+                    return false;
+                }
+
+                origin_x = std::max(0, col_lo - (col_lo % cfg.cell_size));
+                origin_y = std::max(0, row_lo - (row_lo % cfg.cell_size));
+                int data_w = cfg.cells_per_row * cfg.cell_size;
+                if (origin_x + data_w > img_w) origin_x = std::max(0, img_w - data_w);
+
+                int observed_h = row_hi - origin_y + 1;
+                rows = observed_h / cfg.cell_size;
+            }
+
+            if (rows <= 0) {
+                std::cout << "[decoder] sample_frame(" << label << ") rows <= 0\n";
+                return false;
+            }
+
+            const int cols = cfg.cells_per_row;
+            std::vector<int> cells;
+            cells.reserve(rows * cols);
+
+            for (int r = 0; r < rows; ++r) {
+                for (int c = 0; c < cols; ++c) {
+                    int x = origin_x + static_cast<int>(std::round(c * cell_w));
+                    int y = origin_y + static_cast<int>(std::round(r * cell_h));
+                    int cell_px_w = static_cast<int>(std::round(cell_w));
+                    int cell_px_h = static_cast<int>(std::round(cell_h));
+
+                    if (x + cell_px_w > img_w || y + cell_px_h > img_h) {
+                        std::cout << "[decoder] sample_frame(" << label << ") cell out of bounds\n";
+                        return false;
+                    }
+
+                    cv::Rect cell_rect(x, y, cell_px_w, cell_px_h);
+                    cv::Mat roi = aligned(cell_rect);
+                    cv::Scalar mean = cv::mean(roi);
+                    int best = 0;
+                    int bestd = color_distance_sq(mean, cfg.colors[0]);
+                    for (int k = 1; k < 4; ++k) {
+                        int d = color_distance_sq(mean, cfg.colors[k]);
+                        if (d < bestd) { best = k; bestd = d; }
+                    }
+                    cells.push_back(best);
+                }
+            }
+
+            const int total_cells = static_cast<int>(cells.size());
+            const int total_bytes = (total_cells / 4);
+            out_payload.clear();
+            out_payload.reserve(total_bytes);
+            for (int i = 0; i < total_bytes; ++i) {
+                uint8_t b = 0;
+                for (int j = 0; j < 4; ++j) {
+                    int cell_idx = i * 4 + j;
+                    int v = cells[cell_idx] & 0x3;
+                    int shift = 6 - 2 * j;
+                    b |= static_cast<uint8_t>(v << shift);
+                }
+                out_payload.push_back(b);
+            }
+            return true;
+        };
+
+        cv::Mat warped;
+        if (warp_with_finders(frame, warped)) {
+            if (sample_aligned(warped, "warped")) return true;
+            std::cout << "[decoder] sample_frame: warped sampling failed, trying raw" << "\n";
+        } else {
+            std::cout << "[decoder] warp_with_finders failed, trying raw" << "\n";
+        }
+
+        // fallback 1: center-crop square then sample
+        cv::Mat cropped = center_crop_square(frame);
+        if (sample_aligned(cropped, "cropped")) return true;
+
+        // fallback 2: assume input already aligned
+        return sample_aligned(frame, "raw");
+    }
+
+    double laplacian_variance(const cv::Mat& img) {
+        cv::Mat gray;
+        if (img.channels() == 3) cv::cvtColor(img, gray, cv::COLOR_BGR2GRAY);
+        else gray = img;
+        cv::Mat lap;
+        cv::Laplacian(gray, lap, CV_64F);
+        cv::Scalar mu, sigma;
+        cv::meanStdDev(lap, mu, sigma);
+        double var = sigma[0] * sigma[0];
+        return var;
+    }
+
+    cv::Vec3d compute_color_scale(const std::array<cv::Scalar, 4>& expected, const std::array<cv::Scalar, 4>& observed) {
+        // compute per-channel scale as average of observed/expected per color, avoid division by zero
+        double sb = 0, sg = 0, sr = 0; int cnt = 0;
+        for (int i = 0; i < 4; ++i) {
+            const cv::Scalar& e = expected[i];
+            const cv::Scalar& o = observed[i];
+            if (e[0] > 1e-6) { sb += o[0] / e[0]; }
+            if (e[1] > 1e-6) { sg += o[1] / e[1]; }
+            if (e[2] > 1e-6) { sr += o[2] / e[2]; }
+            ++cnt;
+        }
+        if (cnt == 0) return cv::Vec3d(1, 1, 1);
+        return cv::Vec3d(sb / cnt, sg / cnt, sr / cnt);
+    }
+
+} // namespace camcom
