@@ -66,8 +66,7 @@
               "RelativeToolTip": "src\\codec.cpp",
               "ViewState": "AgIAACQAAAAAAAAAAAAqwCcAAAAqAAAAAAAAAA==",
               "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000677|",
-              "WhenOpened": "2026-03-11T12:15:38.241Z",
-              "EditorCaption": ""
+              "WhenOpened": "2026-03-11T12:15:38.241Z"
             },
             {
               "$type": "Document",
@@ -79,8 +78,7 @@
               "RelativeToolTip": "include\\codec.hpp",
               "ViewState": "AgIAABoAAAAAAAAAAAAIwAAAAAAAAAAAAAAAAA==",
               "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000680|",
-              "WhenOpened": "2026-03-11T12:12:59.267Z",
-              "EditorCaption": ""
+              "WhenOpened": "2026-03-11T12:12:59.267Z"
             },
             {
               "$type": "Document",
@@ -92,8 +90,7 @@
               "RelativeToolTip": "include\\common.hpp",
               "ViewState": "AgIAABgAAAAAAAAAAAAIwAAAAAAAAAAAAAAAAA==",
               "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000680|",
-              "WhenOpened": "2026-03-11T12:12:39.845Z",
-              "EditorCaption": ""
+              "WhenOpened": "2026-03-11T12:12:39.845Z"
             },
             {
               "$type": "Document",
@@ -114,7 +111,7 @@
               "RelativeDocumentMoniker": "src\\encoder.cpp",
               "ToolTip": "D:\\vscode\\light\\CamCom-Binary\\src\\encoder.cpp",
               "RelativeToolTip": "src\\encoder.cpp",
-              "ViewState": "AgIAAMcAAAAAAAAAAAD4v38AAAAAAAAAAAAAAA==",
+              "ViewState": "AgIAAMoAAAAAAAAAAAAIwOQAAAABAAAAAAAAAA==",
               "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000677|",
               "WhenOpened": "2026-03-11T11:59:26.8Z",
               "EditorCaption": ""
