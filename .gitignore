@@ -9,6 +9,7 @@
 *.dylib
 *.dll
 *.exe
+*.ipch
 
 # CMake
 CMakeFiles/

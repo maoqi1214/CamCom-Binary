@@ -1,0 +1,22 @@
+{
+    "version": "0.2.1",
+    "defaults": {},
+    "configurations": [
+        {
+            "type": "default",
+            "project": "CMakeLists.txt",
+            "projectTarget": "encoder.exe (bin\\encoder.exe)",
+            "name": "encoder.exe (bin\\encoder.exe)",
+            "args": [ "input.bin", "output.mp4", "15" ],
+            "cwd": "D:\\vscode\\light\\CamCom-Binary\\out\\build\\x64-Release\\bin"
+        },
+        {
+            "type": "default",
+            "projectTarget": "decoder.exe (bin\\decoder.exe)", 
+            "name": "decoder",
+            "project": "CMakeLists.txt",
+            "args": [ "input.mp4", "output.bin" ],
+            "cwd": "D:\\vscode\\light\\CamCom-Binary\\out\\build\\x64-Release\\bin" 
+        }
+    ]
+}

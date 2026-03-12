@@ -63,6 +63,10 @@ struct StreamHeader {
     Encoding encoding;        ///< Encoding scheme used.
     uint32_t fps;             ///< Frames per second of the output video.
     uint32_t cell_size;       ///< Visual cell size in pixels.
+    uint32_t rs_nsym;         ///< Reed-Solomon parity bytes per frame.
+    uint32_t payload_bytes_per_frame; ///< Payload bytes per data frame.
+    uint32_t cells_per_row;   ///< Number of data cells per row used to render frames.
+    uint32_t total_frames;    ///< Total number of data frames that follow.
 };
 
 } // namespace camcom

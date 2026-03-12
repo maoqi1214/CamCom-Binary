@@ -1,0 +1,272 @@
+﻿
+#include "common.hpp"
+#include "io.hpp"
+#include "codec.hpp"
+#include "rs.hpp"
+
+#include <opencv2/opencv.hpp>
+
+#include <cstdlib>
+#include <iostream>
+#include <string>
+#include <vector>
+#include <optional>
+#include <algorithm>
+
+using namespace camcom;
+
+static void print_usage(const char* argv0) {
+    std::cerr
+        << "Usage: " << argv0 << " <recorded.mp4> <output.bin> <validity_mask.bin>\n"
+        << "\n"
+        << "  recorded.mp4      Path to the video file captured by the camera.\n"
+        << "  output.bin        Path where the decoded binary data will be written.\n"
+        << "  validity_mask.bin Path where the per-frame validity mask will be written.\n"
+        << "\n"
+        << "Example:\n"
+        << "  " << argv0 << " captured.mp4 recovered.bin mask.bin\n";
+}
+
+static uint32_t read_u32_le(const uint8_t* p) {
+    return static_cast<uint32_t>(p[0]) |
+           (static_cast<uint32_t>(p[1]) << 8) |
+           (static_cast<uint32_t>(p[2]) << 16) |
+           (static_cast<uint32_t>(p[3]) << 24);
+}
+
+// Find four finder markers (approximate) and compute perspective warp.
+static std::optional<cv::Mat> find_and_warp(const cv::Mat& frame, const EncoderConfig& cfg) {
+    cv::Mat gray;
+    cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+    cv::Mat bw;
+    cv::adaptiveThreshold(gray, bw, 255, cv::ADAPTIVE_THRESH_GAUSSIAN_C, cv::THRESH_BINARY, 15, 2);
+
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(bw, contours, cv::RETR_LIST, cv::CHAIN_APPROX_SIMPLE);
+
+    struct Quad { std::vector<cv::Point> pts; double area; };
+    std::vector<Quad> quads;
+    for (auto &c : contours) {
+        const double area = cv::contourArea(c);
+        if (area < 1000) continue;
+        std::vector<cv::Point> approx;
+        cv::approxPolyDP(c, approx, cv::arcLength(c, true)*0.02, true);
+        if (approx.size() == 4 && cv::isContourConvex(approx)) {
+            quads.push_back({approx, area});
+        }
+    }
+
+    if (quads.size() < 4) return std::nullopt;
+
+    // pick 4 largest
+    std::sort(quads.begin(), quads.end(), [](const Quad&a,const Quad&b){return a.area>b.area;});
+    std::vector<cv::Point2f> corners;
+    for (int i = 0; i < 4 && i < static_cast<int>(quads.size()); ++i) {
+        // compute centroid of quad
+        cv::Moments m = cv::moments(quads[i].pts);
+        if (m.m00 == 0) continue;
+        corners.emplace_back(static_cast<float>(m.m10/m.m00), static_cast<float>(m.m01/m.m00));
+    }
+
+    if (corners.size() < 4) return std::nullopt;
+
+    // sort corners into TL, TR, BR, BL order
+    std::sort(corners.begin(), corners.end(), [](const cv::Point2f&a,const cv::Point2f&b){
+        return a.y < b.y || (a.y==b.y && a.x < b.x);
+    });
+    // now first two are top-left/top-right roughly
+    cv::Point2f tl = corners[0];
+    cv::Point2f tr = corners[1];
+    cv::Point2f bl = corners[2];
+    cv::Point2f br = corners[3];
+    // correct ordering by x
+    if (tl.x > tr.x) std::swap(tl,tr);
+    if (bl.x > br.x) std::swap(bl,br);
+
+    // destination size based on detected quad bounding box
+    const int marker_px = 4 * cfg.cell_size;
+    const int data_w = cfg.cells_per_row * cfg.cell_size;
+    // estimate rows by height proportion
+    double src_w = cv::norm(tr - tl);
+    double src_h = cv::norm(bl - tl);
+    int dst_w = static_cast<int>(std::round(src_w));
+    int dst_h = static_cast<int>(std::round(src_h));
+    // ensure minimum
+    dst_w = std::max(dst_w, data_w + marker_px*2);
+    dst_h = std::max(dst_h, cfg.cell_size*4 + marker_px*2);
+
+    std::vector<cv::Point2f> dst = {
+        cv::Point2f(0.f, 0.f),
+        cv::Point2f(static_cast<float>(dst_w-1), 0.f),
+        cv::Point2f(static_cast<float>(dst_w-1), static_cast<float>(dst_h-1)),
+        cv::Point2f(0.f, static_cast<float>(dst_h-1))
+    };
+
+    std::vector<cv::Point2f> src = { tl, tr, br, bl };
+    cv::Mat H = cv::getPerspectiveTransform(src, dst);
+    cv::Mat warped;
+    cv::warpPerspective(frame, warped, H, cv::Size(dst_w, dst_h));
+    return warped;
+}
+
+int main(int argc, char* argv[]) {
+    if (argc != 4) {
+        print_usage(argv[0]);
+        return static_cast<int>(ExitCode::BadArgs);
+    }
+
+    const std::string video_path  = argv[1];
+    const std::string output_path = argv[2];
+    const std::string mask_path   = argv[3];
+
+    if (!file_exists(video_path)) {
+        std::cerr << "Error: video file not found: " << video_path << "\n";
+        return static_cast<int>(ExitCode::IoError);
+    }
+
+    EncoderConfig cfg;
+
+    cv::VideoCapture cap(video_path);
+    if (!cap.isOpened()) {
+        std::cerr << "Error: failed to open video: " << video_path << "\n";
+        return static_cast<int>(ExitCode::DecodingError);
+    }
+
+    std::vector<std::vector<uint8_t>> frames_buffer;
+    std::vector<uint8_t> frame_valid; // 1 valid, 0 invalid
+    uint32_t expected_total_frames = 0;
+    bool have_stream_header = false;
+
+    uint32_t stream_rs_nsym = 0;
+
+
+    cv::Mat frame;
+    while (cap.read(frame)) {
+        auto warped_opt = find_and_warp(frame, cfg);
+        if (!warped_opt) continue;
+        cv::Mat warped = *warped_opt;
+
+        std::vector<uint8_t> sample;
+        if (!sample_frame(warped, sample, cfg)) continue;
+
+        // If we haven't seen stream header, check whether this frame contains it (stream header is not RS-protected)
+        if (!have_stream_header) {
+            // minimal size for stream header: u32 magic + u8 version + u64 total + u8 encoding + 4*u32*5 = 4+1+8+1+20 = 34
+            if (sample.size() >= 40) {
+                const uint8_t* p = sample.data();
+                uint32_t magic = read_u32_le(p); p += 4;
+                uint8_t version = *p; p += 1;
+                if (magic == MAGIC && version == FORMAT_VERSION) {
+                    // parse stream header fields in same order as encoder
+                    uint64_t total_data = 0;
+                    for (int i = 0; i < 8; ++i) total_data |= static_cast<uint64_t>(p[i]) << (8*i);
+                    p += 8;
+                    uint8_t encoding = *p; p += 1;
+                    uint32_t fps = read_u32_le(p); p += 4;
+                    uint32_t cell_size = read_u32_le(p); p += 4;
+                    uint32_t rs_nsym = read_u32_le(p); p += 4;
+                    uint32_t payload_per = read_u32_le(p); p += 4;
+                    uint32_t cells_per_row = read_u32_le(p); p += 4;
+                    uint32_t total_frames_hdr = read_u32_le(p); p += 4;
+
+                    // apply to cfg
+                    cfg.cell_size = static_cast<int>(cell_size);
+                    cfg.fps = static_cast<int>(fps);
+                    cfg.payload_bytes_per_frame = static_cast<int>(payload_per);
+                    cfg.cells_per_row = static_cast<int>(cells_per_row);
+                    cfg.rs_nsym = static_cast<int>(rs_nsym);
+                    stream_rs_nsym = rs_nsym;
+                    expected_total_frames = total_frames_hdr;
+                    frames_buffer.resize(expected_total_frames);
+                    have_stream_header = true;
+                    // store a valid mark for header frame
+                    frame_valid.push_back(1);
+                    continue;
+                }
+            }
+            // if header not found, skip
+            frame_valid.push_back(0);
+            continue;
+        }
+
+        // For data frames, sample contains codeword = message + parity
+        std::vector<uint8_t> codeword = sample;
+        if (stream_rs_nsym > 0) {
+            if (!rs::decode(codeword, static_cast<int>(stream_rs_nsym))) {
+                frame_valid.push_back(0);
+                continue;
+            }
+        }
+
+        // after RS decode, parse FrameHeader then payload
+        const uint8_t* p = codeword.data();
+        FrameHeader hdr;
+        hdr.magic = read_u32_le(p); p += 4;
+        hdr.version = *p; p += 1;
+        hdr.frame_index = read_u32_le(p); p += 4;
+        hdr.total_frames = read_u32_le(p); p += 4;
+        hdr.payload_bytes = read_u32_le(p); p += 4;
+        hdr.checksum = read_u32_le(p); p += 4;
+
+        if (hdr.magic != MAGIC || hdr.version != FORMAT_VERSION) {
+            frame_valid.push_back(0);
+            continue;
+        }
+
+        size_t payload_len = hdr.payload_bytes;
+        if (p + payload_len > codeword.data() + codeword.size()) {
+            frame_valid.push_back(0);
+            continue;
+        }
+
+        const uint8_t* payload_ptr = p;
+        const uint32_t calc = crc32(payload_ptr, payload_len);
+        if (calc != hdr.checksum) {
+            frame_valid.push_back(0);
+            if (hdr.total_frames > 0) {
+                if (frames_buffer.size() < hdr.total_frames) frames_buffer.resize(hdr.total_frames);
+                if (hdr.frame_index < frames_buffer.size()) frames_buffer[hdr.frame_index].clear();
+            }
+            continue;
+        }
+
+        // accept
+        if (hdr.total_frames > 0 && expected_total_frames == 0) {
+            expected_total_frames = hdr.total_frames;
+            frames_buffer.resize(expected_total_frames);
+        }
+
+        if (hdr.frame_index < frames_buffer.size()) {
+            frames_buffer[hdr.frame_index] = std::vector<uint8_t>(payload_ptr, payload_ptr + payload_len);
+            frame_valid.push_back(1);
+        } else {
+            frame_valid.push_back(0);
+        }
+    }
+
+    // reassemble
+    std::vector<uint8_t> recovered;
+    if (expected_total_frames == 0) {
+        std::cerr << "Warning: no frames decoded successfully." << std::endl;
+    } else {
+        for (uint32_t i = 0; i < expected_total_frames; ++i) {
+            if (i < frames_buffer.size() && !frames_buffer[i].empty()) {
+                recovered.insert(recovered.end(), frames_buffer[i].begin(), frames_buffer[i].end());
+            } else {
+                // missing frame -> skip (could insert zeros)
+            }
+        }
+    }
+
+    // write outputs
+    try {
+        write_binary_file(output_path, recovered);
+        write_binary_file(mask_path, frame_valid);
+    } catch (const std::exception& ex) {
+        std::cerr << "Error writing output: " << ex.what() << "\n";
+        return static_cast<int>(ExitCode::IoError);
+    }
+
+    std::cout << "[decoder] Done. Recovered bytes=" << recovered.size() << "\n";
+    return static_cast<int>(ExitCode::Ok);
+}

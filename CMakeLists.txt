@@ -22,7 +22,7 @@ find_package(OpenCV REQUIRED)
 
 # ---- FFmpeg (libavcodec, libavformat, libavutil) ----
 # Prefer pkg-config when available (Linux/macOS). On Windows, user may need to set paths manually.
-find_package(PkgConfig QUIET)
+#     find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
   pkg_check_modules(AVCODEC REQUIRED libavcodec)
   pkg_check_modules(AVFORMAT REQUIRED libavformat)
@@ -42,6 +42,9 @@ endif()
 add_library(camcom_core
   src/common.cpp
   src/io.cpp
+  src/codec.cpp
+  src/rs.cpp
+  src/tracker.cpp
 )
 
 target_include_directories(camcom_core
@@ -68,6 +71,16 @@ target_link_libraries(encoder PRIVATE camcom_core)
 # ---- decoder executable ----
 add_executable(decoder src/decoder.cpp)
 target_link_libraries(decoder PRIVATE camcom_core)
+
+# ---- unit tests ----
+add_executable(rs_unit_test tests/rs_unit_test.cpp)
+target_link_libraries(rs_unit_test PRIVATE camcom_core)
+
+add_executable(integration_test tests/integration_test.cpp)
+target_link_libraries(integration_test PRIVATE camcom_core)
+
+add_executable(integration_metrics tests/integration_metrics.cpp)
+target_link_libraries(integration_metrics PRIVATE camcom_core)
 
 # Place binaries in build/bin
 set_target_properties(encoder decoder PROPERTIES
