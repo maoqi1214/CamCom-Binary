@@ -148,6 +148,19 @@ CamCom-Binary/
 
 ## 构建与运行
 
+### 使用前提示
+
+- 需要提前安装并确保 `ffmpeg` 已加入系统 `PATH`，否则编码阶段会失败。
+- 推荐在仓库根目录执行命令，避免相对路径找不到输入文件。
+- 当前 `encoder` 命令行参数固定为 3 个：`<input.bin> <output.mp4> <fps>`。
+
+### 参数说明
+
+- `input.bin`：待传输的原始二进制文件路径。
+- `output.mp4`：编码后的视频输出路径。
+- `fps`：输出视频帧率，必须为正整数（建议不超过 15）。
+- `reference_input.bin`（可选，仅 `decoder` 使用）：参考原文件路径，用于解码后精度比对。
+
 构建：
 
 ```bash
@@ -166,6 +179,20 @@ build/bin/encoder <input.bin> <output.mp4> <fps>
 # 解码
 build/bin/decoder <input.mp4> <output.bin> [reference_input.bin]
 ```
+
+Windows PowerShell 示例：
+
+```powershell
+# 在仓库根目录
+./build/bin/encoder.exe ./tests/sample_input.bin ./out.mp4 15
+./build/bin/decoder.exe ./out.mp4 ./recovered.bin ./tests/sample_input.bin
+```
+
+常见问题提示：
+
+- 出现 `ffmpeg command failed`：通常是 `ffmpeg` 未安装或不在 `PATH`。
+- 解码输出为空或字节数异常：优先检查拍摄清晰度、透视角度和光照条件。
+- 传输速率偏低：在保证可识别性的前提下，再调整 `fps` 与编码参数。
 
 示例：
 
