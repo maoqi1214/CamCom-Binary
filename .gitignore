@@ -44,3 +44,17 @@ Thumbs.db
 output/*.bin
 # Do NOT ignore tests/sample_input.bin (it is a committed test fixture)
 !tests/sample_input.bin
+
+# Runtime artifacts
+/temp_frames/
+/temp_frames_dec/
+frame_*.png
+
+# Local generated data files
+/out.bin
+/test.bin
+/recovered.bin
+/validity_mask.bin
+
+# Visual Studio local cache
+/.vs/
