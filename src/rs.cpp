@@ -1,3 +1,5 @@
+// 文件说明：实现 GF(256) 与 Reed-Solomon 编解码核心算法。
+
 #include "rs.hpp"
 #include <vector>
 #include <mutex>

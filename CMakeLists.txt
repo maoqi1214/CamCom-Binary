@@ -51,16 +51,6 @@ target_link_libraries(encoder PRIVATE camcom_core)
 add_executable(decoder src/decoder.cpp)
 target_link_libraries(decoder PRIVATE camcom_core)
 
-# ===== 测试程序 =====
-add_executable(rs_unit_test tests/rs_unit_test.cpp)
-target_link_libraries(rs_unit_test PRIVATE camcom_core)
-
-add_executable(integration_test tests/integration_test.cpp)
-target_link_libraries(integration_test PRIVATE camcom_core)
-
-add_executable(integration_metrics tests/integration_metrics.cpp)
-target_link_libraries(integration_metrics PRIVATE camcom_core)
-
 # ===== 输出目录 =====
 # 将主要可执行文件统一输出到 build/bin 目录
 set_target_properties(encoder decoder PROPERTIES

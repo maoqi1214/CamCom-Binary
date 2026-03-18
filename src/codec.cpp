@@ -1,3 +1,5 @@
+// 文件说明：实现视觉帧渲染、透视矫正与网格采样解码逻辑。
+
 #include "codec.hpp"
 #include "common.hpp"
 

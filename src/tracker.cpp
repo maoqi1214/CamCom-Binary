@@ -1,3 +1,5 @@
+// 文件说明：实现基于 Kalman 的四角点跟踪与预测更新。
+
 #include "tracker.hpp"
 
 namespace camcom {
