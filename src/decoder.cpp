@@ -54,10 +54,16 @@ static bool decode_rs(std::vector<uint8_t>& codeword, uint32_t nsym) {
     if (nsym == 0) {
         return true;
     }
+    // 当前 RS 实现基于 GF(256) 仅稳定支持 n<=255 的码长。
+    // 数据帧码字远大于 255 时，跳过 RS 纠错，后续依赖帧头 + CRC32 做有效性校验。
+    if (codeword.size() > 255) {
+        return true;
+    }
     return rs::decode(codeword, static_cast<int>(nsym));
 }
 
 static bool try_parse_bootstrap(const std::vector<uint8_t>& sample, EncoderConfig& cfg, uint32_t& stream_rs_nsym) {
+    // 启动帧：用于在正式解码前恢复基础参数（网格、纠错等）。
     constexpr size_t kBootstrapBytes = 4 + 1 + 6 * 4;
     if (sample.size() < kBootstrapBytes) {
         return false;
@@ -96,6 +102,7 @@ static bool try_parse_bootstrap(const std::vector<uint8_t>& sample, EncoderConfi
 }
 
 static bool try_parse_stream_header(const std::vector<uint8_t>& sample, uint32_t& stream_rs_nsym, EncoderConfig& cfg, uint32_t& expected_total_frames, uint64_t& expected_total_bytes) {
+    // 流头帧：携带总帧数、总字节数以及编码配置，后续按该配置解码数据帧。
     constexpr size_t kStreamHeaderBytes = 4 + 1 + 8 + 1 + 6 * 4;
     const size_t codeword_len = kStreamHeaderBytes + static_cast<size_t>(stream_rs_nsym);
     if (sample.size() < codeword_len) {
@@ -147,6 +154,7 @@ static bool try_parse_stream_header(const std::vector<uint8_t>& sample, uint32_t
 }
 
 static bool try_parse_data_frame(const std::vector<uint8_t>& sample, uint32_t stream_rs_nsym, const EncoderConfig& cfg, FrameHeader& hdr, std::vector<uint8_t>& payload_out) {
+    // 数据帧解析策略：先按“满负载长度”尝试，再回退到“按帧头声明长度”尝试。
     constexpr size_t kFrameHeaderBytes = 4 + 1 + 4 + 4 + 4 + 4;
     if (sample.size() < kFrameHeaderBytes + static_cast<size_t>(stream_rs_nsym)) {
         return false;
@@ -285,6 +293,7 @@ int main(int argc, char* argv[]) {
     std::cout << "[decoder] Video file exists\n";
 
     EncoderConfig cfg;
+    // 启动默认参数；若检测到 bootstrap / stream header，会被真实参数覆盖。
     cfg.cell_size = 8;
     cfg.cells_per_row = 108;
     cfg.payload_bytes_per_frame = 2875;
@@ -296,6 +305,7 @@ int main(int argc, char* argv[]) {
     fs::create_directory(temp_dir);
 
     std::string ffmpeg_cmd = "ffmpeg -nostdin -y -i " + video_path + " " + temp_dir + "/frame_%d.png";
+    // 先把视频拆帧，后续逐帧走采样 + 协议解析流程。
     std::cout << "[decoder] Running ffmpeg command: " << ffmpeg_cmd << "\n";
     int ffmpeg_result = system(ffmpeg_cmd.c_str());
     if (ffmpeg_result != 0) {
@@ -310,10 +320,11 @@ int main(int argc, char* argv[]) {
     bool have_bootstrap = false;
     bool have_stream_header = false;
 
-    uint32_t stream_rs_nsym = 0;
+    uint32_t stream_rs_nsym = static_cast<uint32_t>(cfg.rs_nsym);
 
     int frame_count = 1;
     while (true) {
+        // 逐帧处理：采样 -> 解析 bootstrap/stream header/data frame。
         std::string frame_file = temp_dir + "/frame_" + std::to_string(frame_count) + ".png";
         if (!fs::exists(frame_file)) {
             break;
@@ -339,14 +350,15 @@ int main(int argc, char* argv[]) {
         }
 
         if (!have_bootstrap) {
+            // bootstrap 可能在压缩/采样噪声下不可读；尽力解析但不作为后续解码的硬门槛。
             if (try_parse_bootstrap(sample, cfg, stream_rs_nsym)) {
                 have_bootstrap = true;
                 std::cout << "[decoder] Found bootstrap frame with config: cell_size=" << cfg.cell_size << ", cells_per_row=" << cfg.cells_per_row << "\n";
             }
-            continue;
         }
 
         if (!have_stream_header) {
+            // 允许在 bootstrap 缺失时直接尝试流头（优先使用默认/当前 RS 配置）。
             if (try_parse_stream_header(sample, stream_rs_nsym, cfg, expected_total_frames, expected_total_bytes)) {
                 have_stream_header = true;
                 std::cout << "[decoder] Found stream header: total_frames=" << expected_total_frames << ", total_bytes=" << expected_total_bytes << "\n";
@@ -364,6 +376,7 @@ int main(int argc, char* argv[]) {
         }
 
         auto it = frames_buffer.find(hdr.frame_index);
+        // 同一 frame_index 只保留第一份有效载荷，避免重复帧覆盖。
         if (it == frames_buffer.end() || it->second.empty()) {
             frames_buffer[hdr.frame_index] = std::move(payload);
             std::cout << "[decoder] Decoded frame " << hdr.frame_index << " of " << hdr.total_frames << "\n";
@@ -374,6 +387,7 @@ int main(int argc, char* argv[]) {
     std::vector<uint8_t> recovered;
 
     if (expected_total_frames == 0) {
+        // 若未拿到流头，则根据已解出的最大帧号估算总帧数。
         if (!frames_buffer.empty()) {
             uint32_t max_index = 0;
             for (const auto& kv : frames_buffer) {
@@ -426,6 +440,7 @@ int main(int argc, char* argv[]) {
         std::cout << "[decoder] Output file written successfully\n";
 
         if (!reference_path.empty()) {
+            // 可选：与原始输入做逐字节比对，输出准确率与掩码文件。
             const auto reference = read_binary_file(reference_path);
             const size_t compare_len = std::min(reference.size(), recovered.size());
             size_t matched = 0;

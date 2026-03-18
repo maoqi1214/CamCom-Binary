@@ -1,4 +1,4 @@
-// 文件说明：实现视觉帧渲染、透视矫正与网格采样解码逻辑。
+//实现视觉帧渲染、透视矫正与网格采样解码逻辑。
 
 #include "codec.hpp"
 #include "common.hpp"
@@ -42,7 +42,7 @@ namespace camcom {
 
         out.create(img_h, img_w, CV_8UC3);
         // 背景填充为灰色
-        out.setTo(cv::Scalar(128, 128, 128));
+        out.setTo(cv::Scalar(255, 255, 255));
 
         // 在四角绘制定位标记（同心方块）
         auto draw_finder = [&](int x, int y) {
@@ -124,7 +124,11 @@ namespace camcom {
             if (poly.size() < 4) continue;
             cv::Rect bounds = cv::boundingRect(poly);
             double aspect = static_cast<double>(bounds.width) / std::max(1, bounds.height);
-            if (aspect < 0.7 || aspect > 1.3) continue;
+            // 允许更宽的长宽比区间，提升透视畸变场景下的定位块召回。
+            if (aspect < 0.5 || aspect > 2.0) continue;
+            // 使用面积占比区间过滤细长噪声轮廓。
+            double fill_ratio = area / std::max(1.0, static_cast<double>(bounds.area()));
+            if (fill_ratio < 0.45 || fill_ratio > 1.05) continue;
             cv::Moments m = cv::moments(poly);
             cv::Point2f center(static_cast<float>(m.m10 / m.m00), static_cast<float>(m.m01 / m.m00));
             candidates.push_back({ area, poly, center });
@@ -132,7 +136,22 @@ namespace camcom {
 
         if (candidates.size() < 4) return false;
         std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) { return a.area > b.area; });
-        if (candidates.size() > 16) candidates.resize(16);
+        if (candidates.size() > 24) candidates.resize(24);
+
+        // 基于候选面积中位数做区间比例筛选，避免固定阈值在拍摄尺度变化时不稳定。
+        const int stat_n = std::min(8, static_cast<int>(candidates.size()));
+        std::vector<double> area_stats;
+        area_stats.reserve(stat_n);
+        for (int i = 0; i < stat_n; ++i) area_stats.push_back(candidates[i].area);
+        std::sort(area_stats.begin(), area_stats.end());
+        const double median_area = area_stats[stat_n / 2];
+        const double min_area = median_area * 0.35;
+        const double max_area = median_area * 2.8;
+        candidates.erase(std::remove_if(candidates.begin(), candidates.end(), [&](const Candidate& c) {
+            return c.area < min_area || c.area > max_area;
+            }), candidates.end());
+
+        if (candidates.size() < 4) return false;
 
         auto pick_unique = [&](bool find_max, auto score_fn, std::vector<int>& used) {
             int best_i = -1;
