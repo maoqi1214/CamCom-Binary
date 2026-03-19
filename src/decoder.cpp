@@ -444,11 +444,11 @@ int main(int argc, char* argv[]) {
             const auto reference = read_binary_file(reference_path);
             const size_t compare_len = std::min(reference.size(), recovered.size());
             size_t matched = 0;
-            std::vector<uint8_t> v1_mask(reference.size(), 0);
+            std::vector<uint8_t> v1_mask(reference.size(), 0x00);
             for (size_t i = 0; i < compare_len; ++i) {
                 if (reference[i] == recovered[i]) {
                     ++matched;
-                    v1_mask[i] = 1;
+                    v1_mask[i] = 0xFF;
                 }
             }
 
@@ -464,7 +464,7 @@ int main(int argc, char* argv[]) {
                 << "  compared bytes : " << compare_len << "\n"
                 << "  matched bytes  : " << matched << "\n"
                 << "  accuracy       : " << std::fixed << std::setprecision(2) << accuracy << "%\n"
-                << "  v1 mask file   : v1.bin (1=correct, 0=wrong)\n";
+                << "  v1 mask file   : v1.bin (0xFF=correct, 0x00=wrong)\n";
         }
     }
     catch (const std::exception& ex) {
