@@ -139,11 +139,9 @@ static std::vector<uint8_t> build_frame_codeword(uint32_t fi, uint32_t total_fra
     return frame_buf;
 }
 
-static void write_frame_pair(const cv::Mat& img, const cv::Mat& black, const std::string& temp_dir, size_t& frame_count) {
+static void write_frame(const cv::Mat& img, const std::string& temp_dir, size_t& frame_count) {
     const std::string frame_path = temp_dir + "/frame_" + std::to_string(frame_count++) + ".png";
     cv::imwrite(frame_path, img);
-    const std::string black_path = temp_dir + "/frame_" + std::to_string(frame_count++) + ".png";
-    cv::imwrite(black_path, black);
 }
 
 static cv::Mat fit_to_video_canvas(const cv::Mat& src, int canvas_w, int canvas_h) {
@@ -228,12 +226,10 @@ int main(int argc, char* argv[]) {
 
     render_frame(first_img, bootstrap_buf, cfg);
     first_img = fit_to_video_canvas(first_img, video_w, video_h);
-    cv::Mat black0(video_h, video_w, CV_8UC3, cv::Scalar(0, 0, 0));
-
     // 重复输出若干次 Bootstrap 帧，提升鲁棒性
     const int BOOTSTRAP_REPEAT = 3;
     for (int i = 0; i < BOOTSTRAP_REPEAT; ++i) {
-        write_frame_pair(first_img, black0, temp_dir, frame_count);
+        write_frame(first_img, temp_dir, frame_count);
     }
 
     // 写入带 RS 冗余保护的 StreamHeader
@@ -244,10 +240,10 @@ int main(int argc, char* argv[]) {
     // 多次重复输出受 RS 保护的 StreamHeader，确保解码端更容易捕获
     const int STREAMHDR_REPEAT = 3;
     for (int i = 0; i < STREAMHDR_REPEAT; ++i) {
-        write_frame_pair(first_img, black0, temp_dir, frame_count);
+        write_frame(first_img, temp_dir, frame_count);
     }
 
-    std::cout << "[encoder][步骤 6/8] 生成数据帧与黑帧...\n";
+    std::cout << "[encoder][步骤 6/8] 生成数据帧...\n";
     for (uint32_t fi = 0; fi < total_frames; ++fi) {
         const size_t offset = static_cast<size_t>(fi) * payload_per_frame;
         const size_t remain = (offset < data.size()) ? (data.size() - offset) : 0;
@@ -260,11 +256,6 @@ int main(int argc, char* argv[]) {
         first_img = fit_to_video_canvas(first_img, video_w, video_h);
         const std::string frame_path = temp_dir + "/frame_" + std::to_string(frame_count++) + ".png";
         cv::imwrite(frame_path, first_img);
-
-        // 插入黑色过渡帧，降低运动模糊伪影影响
-        cv::Mat black(video_h, video_w, CV_8UC3, cv::Scalar(0, 0, 0));
-        const std::string black_path = temp_dir + "/frame_" + std::to_string(frame_count++) + ".png";
-        cv::imwrite(black_path, black);
 
         if ((fi + 1) % 20 == 0 || fi + 1 == total_frames) {
             std::cout << "[encoder] 已完成数据帧 " << (fi + 1) << "/" << total_frames << "\n";

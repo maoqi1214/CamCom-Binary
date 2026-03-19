@@ -14,9 +14,26 @@
 #include <unordered_map>
 #include <filesystem>
 #include <iomanip>
+#include <array>
+#include <clocale>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 using namespace camcom;
 namespace fs = std::filesystem;
+
+static void init_console_utf8() {
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+#endif
+    std::setlocale(LC_ALL, ".UTF-8");
+}
 
 static void print_usage(const char* argv0) {
     std::cerr
@@ -62,6 +79,21 @@ static bool decode_rs(std::vector<uint8_t>& codeword, uint32_t nsym) {
     return rs::decode(codeword, static_cast<int>(nsym));
 }
 
+static bool is_sane_config_fields(uint32_t rs_nsym,
+    uint32_t cell_size,
+    uint32_t cells_per_row,
+    uint32_t payload_per,
+    uint32_t fps,
+    uint32_t reference_block_size) {
+    if (rs_nsym > 255) return false;
+    if (cell_size < 2 || cell_size > 64) return false;
+    if (cells_per_row < 8 || cells_per_row > 1024) return false;
+    if (payload_per == 0 || payload_per > (1u << 20)) return false;
+    if (fps == 0 || fps > 120) return false;
+    if (reference_block_size == 0 || reference_block_size > 16) return false;
+    return true;
+}
+
 static bool try_parse_bootstrap(const std::vector<uint8_t>& sample, EncoderConfig& cfg, uint32_t& stream_rs_nsym) {
     // 启动帧：用于在正式解码前恢复基础参数（网格、纠错等）。
     constexpr size_t kBootstrapBytes = 4 + 1 + 6 * 4;
@@ -69,7 +101,9 @@ static bool try_parse_bootstrap(const std::vector<uint8_t>& sample, EncoderConfi
         return false;
     }
 
-    for (size_t off = 0; off + kBootstrapBytes <= sample.size(); ++off) {
+    // bootstrap 应该位于采样起始区域附近，限制扫描窗口可显著降低误命中概率。
+    const size_t max_scan_off = std::min(sample.size() - kBootstrapBytes, static_cast<size_t>(32));
+    for (size_t off = 0; off <= max_scan_off; ++off) {
         const uint8_t* p = sample.data() + static_cast<std::ptrdiff_t>(off);
         uint32_t magic = read_u32_le(p); p += 4;
         uint8_t version = *p; p += 1;
@@ -84,7 +118,7 @@ static bool try_parse_bootstrap(const std::vector<uint8_t>& sample, EncoderConfi
         uint32_t fps = read_u32_le(p); p += 4;
         uint32_t reference_block_size = read_u32_le(p); p += 4;
 
-        if (cell_size == 0 || cells_per_row == 0 || payload_per == 0 || fps == 0 || rs_nsym > 255 || reference_block_size == 0) {
+        if (!is_sane_config_fields(rs_nsym, cell_size, cells_per_row, payload_per, fps, reference_block_size)) {
             continue;
         }
 
@@ -135,7 +169,10 @@ static bool try_parse_stream_header(const std::vector<uint8_t>& sample, uint32_t
         uint32_t cells_per_row = read_u32_le(p); p += 4;
         uint32_t total_frames_hdr = read_u32_le(p); p += 4;
 
-        if (cell_size == 0 || payload_per == 0 || cells_per_row == 0 || total_frames_hdr == 0 || rs_nsym > 255) {
+        if (total_frames_hdr == 0) {
+            continue;
+        }
+        if (!is_sane_config_fields(rs_nsym, cell_size, cells_per_row, payload_per, fps, cfg.reference_block_size > 0 ? static_cast<uint32_t>(cfg.reference_block_size) : 2u)) {
             continue;
         }
 
@@ -265,6 +302,7 @@ static bool try_parse_data_frame(const std::vector<uint8_t>& sample, uint32_t st
 }
 
 int main(int argc, char* argv[]) {
+    init_console_utf8();
     std::cout << "[decoder] Starting...\n";
     std::cout << "[decoder] argc: " << argc << "\n";
     for (int i = 0; i < argc; ++i) {
@@ -320,7 +358,19 @@ int main(int argc, char* argv[]) {
     bool have_bootstrap = false;
     bool have_stream_header = false;
 
+    int sampled_frames = 0;
+    int dedup_skipped_frames = 0;
+    int sample_failed_frames = 0;
+    int parsed_data_frames = 0;
+    int bootstrap_hits = 0;
+    int stream_header_hits = 0;
+    int candidate_parse_attempts = 0;
+
+    int orient_sample_hits = 0;
+    int orient_data_hits = 0;
+
     uint32_t stream_rs_nsym = static_cast<uint32_t>(cfg.rs_nsym);
+    cv::Mat prev_thumb_gray;
 
     int frame_count = 1;
     while (true) {
@@ -343,43 +393,141 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
-        std::vector<uint8_t> sample;
-        if (!sample_frame(frame, sample, cfg)) {
+        // 手机录屏/拍摄常出现大量重复帧，先做轻量去重，避免无效重算。
+        {
+            cv::Mat thumb, thumb_gray;
+            cv::resize(frame, thumb, cv::Size(64, 64), 0, 0, cv::INTER_AREA);
+            cv::cvtColor(thumb, thumb_gray, cv::COLOR_BGR2GRAY);
+            if (!prev_thumb_gray.empty()) {
+                cv::Mat diff;
+                cv::absdiff(thumb_gray, prev_thumb_gray, diff);
+                cv::Scalar mdiff = cv::mean(diff);
+                if (mdiff[0] < 1.5) {
+                    ++dedup_skipped_frames;
+                    continue;
+                }
+            }
+            prev_thumb_gray = thumb_gray;
+        }
+
+        // 4K 帧会显著拖慢检测；先等比缩放到可控尺寸。
+        cv::Mat proc = frame;
+        {
+            const int max_side = std::max(frame.cols, frame.rows);
+            constexpr int kDecodeMaxSide = 1280;
+            if (max_side > kDecodeMaxSide) {
+                const double scale = static_cast<double>(kDecodeMaxSide) / static_cast<double>(max_side);
+                cv::resize(frame, proc, cv::Size(), scale, scale, cv::INTER_AREA);
+            }
+        }
+
+        struct SampleCandidate {
+            const char* scale_name;
+            std::vector<uint8_t> bytes;
+        };
+
+        std::vector<SampleCandidate> sample_candidates;
+        sample_candidates.reserve(4);
+
+        auto collect_sample = [&](const char* scale_name, const cv::Mat& img) {
+            std::vector<uint8_t> s;
+            if (sample_frame(img, s, cfg) && !s.empty()) {
+                sample_candidates.push_back({ scale_name, std::move(s) });
+                ++orient_sample_hits;
+            }
+        };
+
+        // 先尝试降采样版本；若尚未锁定流头，再补充一次原分辨率尝试以提升首帧参数识别率。
+        collect_sample("scaled", proc);
+        const bool need_bootstrap_probe = (!have_stream_header && sampled_frames < 160 && (proc.cols != frame.cols || proc.rows != frame.rows));
+        if (need_bootstrap_probe) {
+            collect_sample("full", frame);
+        }
+
+        ++sampled_frames;
+        if (sample_candidates.empty()) {
             std::cout << "[decoder] Failed to sample frame\n";
+            ++sample_failed_frames;
             continue;
         }
 
-        if (!have_bootstrap) {
-            // bootstrap 可能在压缩/采样噪声下不可读；尽力解析但不作为后续解码的硬门槛。
-            if (try_parse_bootstrap(sample, cfg, stream_rs_nsym)) {
-                have_bootstrap = true;
-                std::cout << "[decoder] Found bootstrap frame with config: cell_size=" << cfg.cell_size << ", cells_per_row=" << cfg.cells_per_row << "\n";
-            }
+        if (sampled_frames <= 10 || sampled_frames % 120 == 0) {
+            std::cout << "[decoder][diag] frame sampled ok, candidates=" << sample_candidates.size()
+                << ", cfg(cell=" << cfg.cell_size
+                << ", cols=" << cfg.cells_per_row
+                << ", payload=" << cfg.payload_bytes_per_frame
+                << ", rs=" << stream_rs_nsym << ")\n";
         }
 
-        if (!have_stream_header) {
-            // 允许在 bootstrap 缺失时直接尝试流头（优先使用默认/当前 RS 配置）。
-            if (try_parse_stream_header(sample, stream_rs_nsym, cfg, expected_total_frames, expected_total_bytes)) {
-                have_stream_header = true;
-                std::cout << "[decoder] Found stream header: total_frames=" << expected_total_frames << ", total_bytes=" << expected_total_bytes << "\n";
+        bool frame_decoded = false;
+        for (auto& cand : sample_candidates) {
+            ++candidate_parse_attempts;
+            auto& sample = cand.bytes;
+            if (!have_bootstrap && !have_stream_header) {
+                // bootstrap 可能在压缩/采样噪声下不可读；尽力解析但不作为后续解码的硬门槛。
+                if (try_parse_bootstrap(sample, cfg, stream_rs_nsym)) {
+                    have_bootstrap = true;
+                    ++bootstrap_hits;
+                    std::cout << "[decoder] Found bootstrap frame with config: cell_size=" << cfg.cell_size << ", cells_per_row=" << cfg.cells_per_row << "\n";
+                }
             }
+
+            if (!have_stream_header) {
+                // 允许在 bootstrap 缺失时直接尝试流头（优先使用默认/当前 RS 配置）。
+                if (try_parse_stream_header(sample, stream_rs_nsym, cfg, expected_total_frames, expected_total_bytes)) {
+                    have_stream_header = true;
+                    ++stream_header_hits;
+                    std::cout << "[decoder] Found stream header: total_frames=" << expected_total_frames << ", total_bytes=" << expected_total_bytes << "\n";
+                }
+            }
+
+            FrameHeader hdr{};
+            std::vector<uint8_t> payload;
+            if (!try_parse_data_frame(sample, stream_rs_nsym, cfg, hdr, payload)) {
+                continue;
+            }
+
+            if (hdr.total_frames > 0 && expected_total_frames == 0) {
+                expected_total_frames = hdr.total_frames;
+            }
+
+            auto it = frames_buffer.find(hdr.frame_index);
+            // 同一 frame_index 只保留第一份有效载荷，避免重复帧覆盖。
+            if (it == frames_buffer.end() || it->second.empty()) {
+                frames_buffer[hdr.frame_index] = std::move(payload);
+                std::cout << "[decoder] Decoded frame " << hdr.frame_index << " of " << hdr.total_frames << "\n";
+                ++parsed_data_frames;
+                ++orient_data_hits;
+            }
+
+            frame_decoded = true;
+            break;
         }
 
-        FrameHeader hdr{};
-        std::vector<uint8_t> payload;
-        if (!try_parse_data_frame(sample, stream_rs_nsym, cfg, hdr, payload)) {
+        if (!frame_decoded) {
+            if (sampled_frames <= 10 || sampled_frames % 120 == 0) {
+                auto count_magic_hits = [&](const std::vector<uint8_t>& s) {
+                    int hits = 0;
+                    if (s.size() < 4) return 0;
+                    for (size_t i = 0; i + 4 <= s.size(); ++i) {
+                        if (read_u32_le(s.data() + static_cast<std::ptrdiff_t>(i)) == MAGIC) {
+                            ++hits;
+                        }
+                    }
+                    return hits;
+                };
+
+                std::cout << "[decoder][diag] frame parse miss: candidates=" << sample_candidates.size()
+                    << " [";
+                for (size_t i = 0; i < sample_candidates.size(); ++i) {
+                    const auto& c = sample_candidates[i];
+                    std::cout << c.scale_name << ":len=" << c.bytes.size()
+                        << ",magic=" << count_magic_hits(c.bytes);
+                    if (i + 1 < sample_candidates.size()) std::cout << ", ";
+                }
+                std::cout << "]\n";
+            }
             continue;
-        }
-
-        if (hdr.total_frames > 0 && expected_total_frames == 0) {
-            expected_total_frames = hdr.total_frames;
-        }
-
-        auto it = frames_buffer.find(hdr.frame_index);
-        // 同一 frame_index 只保留第一份有效载荷，避免重复帧覆盖。
-        if (it == frames_buffer.end() || it->second.empty()) {
-            frames_buffer[hdr.frame_index] = std::move(payload);
-            std::cout << "[decoder] Decoded frame " << hdr.frame_index << " of " << hdr.total_frames << "\n";
         }
     }
 
@@ -474,6 +622,16 @@ int main(int argc, char* argv[]) {
     }
 
     fs::remove_all(temp_dir);
+    std::cout << "[decoder] Stats: sampled=" << sampled_frames
+        << ", dedup_skipped=" << dedup_skipped_frames
+        << ", sample_failed=" << sample_failed_frames
+        << ", parsed_data=" << parsed_data_frames << "\n";
+    std::cout << "[decoder] ParseStats: bootstrap_hits=" << bootstrap_hits
+        << ", stream_header_hits=" << stream_header_hits
+        << ", candidate_parse_attempts=" << candidate_parse_attempts
+        << ", buffered_frames=" << frames_buffer.size() << "\n";
+    std::cout << "[decoder] OrientStats(sample_hits): single=" << orient_sample_hits << "\n";
+    std::cout << "[decoder] OrientStats(data_hits): single=" << orient_data_hits << "\n";
     std::cout << "[decoder] Done. Recovered bytes=" << recovered.size() << "\n";
     return static_cast<int>(ExitCode::Ok);
 }
