@@ -1,19 +1,13 @@
+// CRC32 implementation used across the project.
 #include "common.hpp"
 
 #include <mutex>
-#include <stdexcept>
-#include <string>
 
 namespace camcom {
-
-// ---------------------------------------------------------------------------
-// CRC-32 implementation (ISO 3309 / ITU-T V.42 polynomial)
-// ---------------------------------------------------------------------------
 
 static uint32_t crc32_table[256];
 static std::once_flag crc32_init_flag;
 
-//构建CRC-32查找表
 static void build_crc32_table() {
     for (uint32_t i = 0; i < 256; ++i) {
         uint32_t crc = i;

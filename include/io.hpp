@@ -1,3 +1,4 @@
+// Binary file I/O and basic file utility interfaces.
 #pragma once
 
 #include <cstdint>

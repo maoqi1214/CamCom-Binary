@@ -1,3 +1,4 @@
+// Binary file I/O and basic file state helpers.
 #include "io.hpp"
 
 #include <fstream>

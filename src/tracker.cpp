@@ -1,20 +1,20 @@
-// 文件说明：实现基于 Kalman 的四角点跟踪与预测更新。
+// Kalman-based tracking and prediction for four corner points.
 
 #include "tracker.hpp"
 
 namespace camcom {
 
-CornerKalman::CornerKalman() : kf_(4,2,0) {
+CornerKalman::CornerKalman() : kf_(4, 2, 0) {
     // state: x, y, vx, vy
     // measurement: x, y
-    kf_.transitionMatrix = (cv::Mat_<float>(4,4) <<
-        1,0,1,0,
-        0,1,0,1,
-        0,0,1,0,
-        0,0,0,1);
-    kf_.measurementMatrix = cv::Mat::zeros(2,4,CV_32F);
-    kf_.measurementMatrix.at<float>(0,0) = 1.0f;
-    kf_.measurementMatrix.at<float>(1,1) = 1.0f;
+    kf_.transitionMatrix = (cv::Mat_<float>(4, 4) <<
+        1, 0, 1, 0,
+        0, 1, 0, 1,
+        0, 0, 1, 0,
+        0, 0, 0, 1);
+    kf_.measurementMatrix = cv::Mat::zeros(2, 4, CV_32F);
+    kf_.measurementMatrix.at<float>(0, 0) = 1.0f;
+    kf_.measurementMatrix.at<float>(1, 1) = 1.0f;
     cv::setIdentity(kf_.processNoiseCov, cv::Scalar::all(1e-3));
     cv::setIdentity(kf_.measurementNoiseCov, cv::Scalar::all(1e-2));
     cv::setIdentity(kf_.errorCovPost, cv::Scalar::all(1));
@@ -34,17 +34,16 @@ cv::Point2f CornerKalman::predict() {
 }
 
 cv::Point2f CornerKalman::correct(const cv::Point2f& meas) {
-    cv::Mat measurement(2,1,CV_32F);
+    cv::Mat measurement(2, 1, CV_32F);
     measurement.at<float>(0) = meas.x;
     measurement.at<float>(1) = meas.y;
     cv::Mat state = kf_.correct(measurement);
     return cv::Point2f(state.at<float>(0), state.at<float>(1));
 }
 
-// QuadTracker
 QuadTracker::QuadTracker() {}
 
-void QuadTracker::init(const std::array<cv::Point2f,4>& pts) {
+void QuadTracker::init(const std::array<cv::Point2f, 4>& pts) {
     for (int i = 0; i < 4; ++i) {
         corners_[i].init(pts[i]);
         last_[i] = pts[i];
@@ -52,7 +51,7 @@ void QuadTracker::init(const std::array<cv::Point2f,4>& pts) {
     initialized_ = true;
 }
 
-void QuadTracker::update(const std::array<cv::Point2f,4>& meas) {
+void QuadTracker::update(const std::array<cv::Point2f, 4>& meas) {
     if (!initialized_) {
         init(meas);
         return;
@@ -66,7 +65,7 @@ void QuadTracker::update(const std::array<cv::Point2f,4>& meas) {
     }
 }
 
-std::array<cv::Point2f,4> QuadTracker::get() const {
+std::array<cv::Point2f, 4> QuadTracker::get() const {
     return last_;
 }
 

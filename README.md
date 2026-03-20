@@ -1,202 +1,231 @@
 # CamCom-Binary
 
-`CamCom-Binary` 是一个基于 C++ 的“屏幕到相机”二进制传输系统：
-它将任意二进制文件编码为视频帧（含定位标记、帧头、CRC、Reed-Solomon 冗余），并在解码端从视频中恢复原始字节流。
+这是一个把二进制文件编码成视频、再从视频里还原二进制文件的 C++ 项目。
 
-当前代码已具备可运行的编码与解码流程，不再是仅含 TODO 的骨架工程。
+项目当前包含两个程序：
 
-## 1. 项目概述
+- `encoder.exe`：把 `input.bin` 编码成 `output.mp4`
+- `decoder.exe`：把 `input.mp4` 解码回 `output.bin`
 
-核心功能：
+项目依赖：
 
-- 将输入二进制文件切分为多帧数据并编码为视频。
-- 使用四角定位标记 + 透视矫正 + 网格采样恢复数据。
-- 使用 `CRC-32` 做帧级校验，使用 `Reed-Solomon` 做纠错。
-- 通过 `bootstrap` 帧和 `stream header` 帧传输解码参数，降低配置耦合。
-- 支持端到端测试与指标统计（BER、吞吐、帧成功率）。
+- `OpenCV`：图像处理
+- `ffmpeg.exe`：视频封装和抽帧
+- `CMake + Visual Studio 2026`：本地构建
 
-主要特性：
+## 1. 需要先准备什么
 
-- 高鲁棒性数据帧设计：数据帧之间插入黑帧以降低运动模糊影响。
-- 码流自描述：解码端可先读取 `bootstrap` 自动获知参数。
-- 视觉编码采用 2-bit 单元（4 色映射），提升单帧信息密度。
-- 工程结构清晰：核心库 `camcom_core` + 多个可执行目标（`encoder`、`decoder`、测试程序）。
+在本地运行前，需要先装好下面 4 个东西：
 
-## 2. 技术栈
+### 1. Visual Studio 2026
 
-| 分类 | 技术 |
-|---|---|
-| 前端 | 无（命令行应用，不含 Web/UI 前端） |
-| 后端 | C++、OpenCV（图像处理/视频读写）、FFmpeg 命令行（图像序列与视频互转） |
-| 数据库 | 无 |
-| 开发工具 | CMake、Ninja、Visual Studio/CMake 工作流 |
+安装时勾选：
 
-说明：项目不直接链接 FFmpeg 开发库，而是通过系统 `ffmpeg` 可执行文件完成封装/拆帧。
+- `Desktop development with C++`
 
-## 3. 项目架构
+### 2. CMake
 
-整体为“编码端 + 传输介质 + 解码端”的离线链路架构。
+安装完成后，在命令行里确认：
 
-数据流向：
+```bat
+cmake --version
+```
 
-1. `encoder` 读取原始二进制文件。
-2. 生成 `bootstrap` 与 `stream header`，再按帧打包业务数据（帧头 + payload + RS）。
-3. `codec` 将每帧数据渲染为带定位标记的图像序列。
-4. 通过 `ffmpeg` 将图像序列编码成视频。
-5. `decoder` 先用 `ffmpeg` 抽帧，再对每帧做采样与解析。
-6. 依次识别 `bootstrap`、`stream header`、数据帧，做 RS 解码与 CRC 校验。
-7. 重组输出二进制文件；可选与参考文件对比并输出精度报告。
+### 3. OpenCV
 
-模块关系：
+你最终需要拿到一个包含 `OpenCVConfig.cmake` 的目录。
 
-- `src/encoder.cpp`、`src/decoder.cpp`：两个入口程序。
-- `src/codec.cpp`：视觉渲染与网格采样核心。
-- `src/rs.cpp`：GF(256) + RS 编解码实现。
-- `src/common.cpp`：CRC-32 与公共常量/结构。
-- `src/io.cpp`：二进制文件读写工具。
-
-## 4. 目录结构
-
-以下目录树基于当前仓库实际文件整理（已忽略 `.git`、`node_modules`、`venv`、`dist` 等无关目录）：
+常见路径示例：
 
 ```text
-CamCom-Binary/
-├── CMakeLists.txt
-├── CMakeSettings.json
-├── README.md
-├── LICENSE
-├── docs/
-│   ├── design.md
-│   ├── format.md
-│   └── usage.md
-├── include/
-│   ├── codec.hpp
-│   ├── common.hpp
-│   ├── io.hpp
-│   ├── rs.hpp
-│   └── tracker.hpp
-├── src/
-│   ├── codec.cpp
-│   ├── common.cpp
-│   ├── decoder.cpp
-│   ├── encoder.cpp
-│   ├── io.cpp
-│   ├── rs.cpp
-│   └── tracker.cpp
-├── tests/
-│   ├── README.md
-│   ├── integration_metrics.cpp
-│   ├── integration_test.cpp
-│   ├── rs_unit_test.cpp
-│   ├── payload.bin
-│   └── sample_input.bin
-├── out.bin
-├── test.bin
-└── temp_frames_dec/
-    └── frame_*.png
+opencv\build\x64\vc16\lib
 ```
 
-目录说明：
+注意：
 
-- `include/`：核心接口与数据结构定义，是跨模块协作边界。
-- `src/`：核心业务逻辑实现，包含编码、解码、纠错、采样等关键流程。
-- `tests/`：单元测试与集成测试程序及测试样本。
-- `docs/`：设计和格式文档（其中部分内容仍保留早期占位描述，建议后续同步更新）。
+- 传给 `build_vs26.bat` 的不是 OpenCV 根目录
+- 传的是 `OpenCVConfig.cmake` 所在目录
+- 也就是上面这个 `...\lib` 目录
 
-## 5. 核心文件说明
+### 4. FFmpeg
 
-### 5.1 项目入口文件和配置文件
+这一项最容易配错，所以这里写清楚。
 
-- `CMakeLists.txt`
-  - 定义 `camcom_core` 核心库。
-  - 构建可执行文件：`encoder`、`decoder`、`rs_unit_test`、`integration_test`、`integration_metrics`。
-  - 依赖 `OpenCV`，并设置 `encoder/decoder` 输出到 `build/bin`。
-- `src/encoder.cpp`
-  - 编码端主入口：读文件、分帧、生成帧头与校验、渲染图像并调用 `ffmpeg` 生成视频。
-- `src/decoder.cpp`
-  - 解码端主入口：抽帧、采样、解析帧类型、纠错与校验、重组输出。
+你们要下载的是：
 
-### 5.2 核心业务逻辑实现
+- Windows 版 FFmpeg
+- 下载后解压
+- 最后要能看到 `ffmpeg.exe`
 
-- `src/codec.cpp`
-  - `render_frame`：将字节序列映射到彩色网格，叠加四角定位标记与辅助标记。
-  - `sample_frame`：支持 raw/warp/crop 多路径采样回退，提高复杂画面下恢复率。
-  - `warp_with_finders`：基于轮廓候选检测定位块并执行透视变换。
-- `src/rs.cpp`
-  - 完整实现 GF(256) 运算、RS 编码与解码流程（含 Berlekamp-Massey、Forney 等）。
-- `src/common.cpp`
-  - CRC-32 计算实现，用于帧 payload 完整性校验。
+解压后通常会长这样：
 
-### 5.3 数据模型和 API 接口
-
-- `include/common.hpp`
-  - 定义常量（`MAGIC`、`FORMAT_VERSION` 等）、退出码枚举、编码方式枚举。
-  - 定义 `FrameHeader`、`StreamHeader` 两类关键数据模型。
-- `include/codec.hpp`
-  - 定义 `EncoderConfig` 与视觉编解码接口（渲染、采样、清晰度评估、颜色标定）。
-- `include/rs.hpp`
-  - 定义 RS 编解码公开接口。
-- `include/io.hpp`
-  - 定义二进制读写和文件存在性/大小查询接口。
-
-### 5.4 关键组件和服务模块
-
-- `src/io.cpp`：文件读写基础设施。
-- `src/tracker.cpp` + `include/tracker.hpp`：四角点 Kalman 跟踪组件（可作为解码端稳态跟踪能力基础）。
-- `tests/integration_test.cpp`：从模拟编码到模拟采集再解码的端到端验证。
-- `tests/integration_metrics.cpp`：输出 BER、吞吐率、帧成功率等指标，支持性能与可靠性评估。
-
-## 构建与运行
-
-### 使用前提示
-
-- 需要提前安装并确保 `ffmpeg` 已加入系统 `PATH`，否则编码阶段会失败。
-- 推荐在仓库根目录执行命令，避免相对路径找不到输入文件。
-- 当前 `encoder` 命令行参数固定为 3 个：`<input.bin> <output.mp4> <fps>`。
-
-### 参数说明
-
-- `input.bin`：待传输的原始二进制文件路径。
-- `output.mp4`：编码后的视频输出路径。
-- `fps`：输出视频帧率，必须为正整数（建议不超过 15）。
-- `reference_input.bin`（可选，仅 `decoder` 使用）：参考原文件路径，用于解码后精度比对。
-
-构建：
-
-```bash
-mkdir build
-cd build
-cmake ..
-cmake --build .
+```text
+....ffmpeg\bin\ffmpeg.exe
+或者 ....ffmpeg-master-latest-win64-gpl-shared\bin\ffmpeg.exe
 ```
 
-运行：
+这里真正要加到系统变量 `Path` 的，不是 `ffmpeg.exe` 文件本身，而是它所在的目录：
 
-```bash
-# 编码
-build/bin/encoder <input.bin> <output.mp4> <fps>
-
-# 解码
-build/bin/decoder <input.mp4> <output.bin> [reference_input.bin]
+```text
+....ffmpeg\bin
+或者....ffmpeg-master-latest-win64-gpl-shared\bin
 ```
 
-Windows PowerShell 示例：
+也就是说，你应该这样做：
 
-```powershell
-# 在仓库根目录
-./build/bin/encoder.exe ./tests/sample_input.bin ./out.mp4 15
-./build/bin/decoder.exe ./out.mp4 ./recovered.bin ./tests/sample_input.bin
+1. 下载 FFmpeg 的 Windows 压缩包
+2. 解压到一个固定目录，例如 `D:\tools\ffmpeg`
+3. 确认 `ffmpeg.exe` 在 `D:\tools\ffmpeg\bin\ffmpeg.exe`
+4. 把 `D:\tools\ffmpeg\bin` 加进系统环境变量 `Path`
+5. 重新打开终端
+6. 执行下面两条命令检查是否成功：
+
+```bat
+where ffmpeg
+ffmpeg -version
 ```
 
-常见问题提示：
+如果能输出路径和版本号，就说明 FFmpeg 已经配好了。
 
-- 出现 `ffmpeg command failed`：通常是 `ffmpeg` 未安装或不在 `PATH`。
-- 解码输出为空或字节数异常：优先检查拍摄清晰度、透视角度和光照条件。
-- 传输速率偏低：在保证可识别性的前提下，再调整 `fps` 与编码参数。
+## 2. 项目怎么编译
 
-示例：
+先克隆仓库：
 
-```bash
-build/bin/encoder tests/sample_input.bin out.mp4 10
-build/bin/decoder out.mp4 recovered.bin tests/sample_input.bin
+```bat
+git clone https://github.com/maoqi1214/CamCom-Binary.git
+cd CamCom-Binary
 ```
+
+然后在仓库根目录执行：
+
+```bat
+build_vs26.bat ......\opencv\build\x64\vc16\lib（前面省略号填写你的实际路径）
+```
+
+这里的参数要换成你自己机器上 `OpenCVConfig.cmake` 所在的目录（即bin目录）。
+
+## 3. 编译完成后程序在哪
+
+编译成功后，这两个程序在这里：
+
+```text
+build-vs26\bin\Debug\encoder.exe
+build-vs26\bin\Debug\decoder.exe
+```
+
+## 4. 怎么运行
+
+### 编码（在终端运行，以下input.bin,output.mp4,15是示例，实际使用时要替换,注意文件后缀）
+
+```bat
+build-vs26\bin\Debug\encoder.exe input.bin output.mp4 15
+```
+
+### 解码
+
+```bat
+build-vs26\bin\Debug\decoder.exe input.mp4 recovered.bin
+```
+
+### 可选：和原文件做对比（即decoder有两种编译方式，一个是传两个参数，一个是传三个参数）
+
+```bat
+build-vs26\bin\Debug\decoder.exe input.mp4 recovered.bin input.bin
+```
+（传三个参数时会多输出一个对比文件v1.bin，用于老师的测评代码）
+## 5. 手机录像时的注意事项
+
+如果你是先播放视频，再用手机录屏幕，建议注意：
+
+- 屏幕内容要拍全
+- 尽量避免反光
+- 尽量避免自动曝光剧烈变化
+- 视频最后多停 1 到 2 秒再结束录制
+- 不要让播放器控制条挡住最后几帧
+
+## 6. 最关键的两个路径
+
+### OpenCV 路径
+
+构建脚本参数传这个目录：
+
+```text
+D:\vscode\light\opencv\build\x64\vc16\lib
+```
+
+### FFmpeg 路径
+
+系统变量 `Path` 里加这个目录：
+
+```text
+D:\tools\ffmpeg\bin
+```
+
+
+## 7. 配置完成后自检
+
+配完环境后，可以先检查这三条命令：
+
+```bat
+cmake --version
+where ffmpeg
+ffmpeg -version
+```
+
+如果这三条都正常，再开始执行项目构建。
+
+## 8. 如果你用的是 VS2022
+
+如果你本机安装的是 Visual Studio 2022，那么 `build_vs26.bat` 里的生成器不能直接用。
+
+默认脚本现在写的是：
+
+```bat
+Visual Studio 18 2026
+```
+
+VS2022 对应的生成器是：
+
+```bat
+Visual Studio 17 2022
+```
+
+你有两种做法：
+
+### 做法 1：直接改 `build_vs26.bat`
+
+把脚本里这一行：
+
+```bat
+cmake -S . -B build-vs26 -G "Visual Studio 18 2026" -A x64 -DOpenCV_DIR="%OPENCV_DIR%"
+```
+
+改成：
+
+```bat
+cmake -S . -B build-vs26 -G "Visual Studio 17 2022" -A x64 -DOpenCV_DIR="%OPENCV_DIR%"
+```
+
+然后再执行：
+
+```bat
+build_vs26.bat 你的 OpenCVConfig.cmake 所在目录
+```
+
+### 做法 2：不改脚本，直接在终端执行
+
+在仓库根目录执行：
+
+```bat
+cmake -S . -B build-vs22 -G "Visual Studio 17 2022" -A x64 -DOpenCV_DIR="你的 OpenCV lib 目录"
+cmake --build build-vs22 --config Debug
+```
+
+编译成功后，可执行文件在：
+
+```text
+build-vs22\bin\Debug\encoder.exe
+build-vs22\bin\Debug\decoder.exe
+```
+
+如果是 VS2022，优先推荐做法 2，不会影响别人已经在用的 `build_vs26.bat`。

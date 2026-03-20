@@ -1,5 +1,6 @@
 # Build outputs
 /build/
+/build-vs26/
 /out/
 *.o
 *.obj
@@ -33,16 +34,15 @@ Thumbs.db
 # Logs
 *.log
 
-# Large video/media artifacts — ignore everywhere except committed test assets
+# Large video and media artifacts
 *.mp4
 *.avi
 *.mkv
 *.mov
 
-# Ignore binary output blobs in output directories; keep small test fixtures
+# Output data
 /output/
 output/*.bin
-# Do NOT ignore tests/sample_input.bin (it is a committed test fixture)
 !tests/sample_input.bin
 
 # Runtime artifacts
@@ -54,7 +54,12 @@ frame_*.png
 /out.bin
 /test.bin
 /recovered.bin
+/recovered2.bin
+/smoke.bin
+/smoke2.bin
+/v1.bin
 /validity_mask.bin
 
 # Visual Studio local cache
 /.vs/
+.github/copilot-instructions.md

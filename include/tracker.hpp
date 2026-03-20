@@ -1,3 +1,4 @@
+// Kalman tracker interfaces for smoothing four corner points.
 #pragma once
 
 #include <opencv2/opencv.hpp>

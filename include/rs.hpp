@@ -1,3 +1,4 @@
+// Public Reed-Solomon encoding and decoding interfaces.
 #pragma once
 
 #include <vector>

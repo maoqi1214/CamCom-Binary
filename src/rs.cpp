@@ -1,8 +1,9 @@
-// 文件说明：实现 GF(256) 与 Reed-Solomon 编解码核心算法。
+// Reed-Solomon encoding and decoding over GF(256).
 
 #include "rs.hpp"
-#include <vector>
+
 #include <mutex>
+#include <vector>
 
 namespace camcom { namespace rs {
 
@@ -12,7 +13,7 @@ static uint8_t gf_log[256];
 static std::once_flag init_flag;
 
 void init_tables() {
-    std::call_once(init_flag, [](){
+    std::call_once(init_flag, []() {
         int x = 1;
         for (int i = 0; i < 255; ++i) {
             gf_exp[i] = static_cast<uint8_t>(x);
@@ -22,32 +23,44 @@ void init_tables() {
                 x ^= 0x11d;
             }
         }
-        for (int i = 255; i < 512; ++i) gf_exp[i] = gf_exp[i - 255];
+        for (int i = 255; i < 512; ++i) {
+            gf_exp[i] = gf_exp[i - 255];
+        }
         gf_log[0] = 0;
         tables_inited = true;
     });
 }
 
 static inline uint8_t gf_mul(uint8_t a, uint8_t b) {
-    if (a == 0 || b == 0) return 0;
-    return gf_exp[ (gf_log[a] + gf_log[b]) % 255 ];
+    if (a == 0 || b == 0) {
+        return 0;
+    }
+    return gf_exp[(gf_log[a] + gf_log[b]) % 255];
 }
 
 static inline uint8_t gf_pow(uint8_t a, int power) {
-    if (power == 0) return 1;
-    if (a == 0) return 0;
-    int log = gf_log[a];
-    int idx = (log * power) % 255;
+    if (power == 0) {
+        return 1;
+    }
+    if (a == 0) {
+        return 0;
+    }
+    const int log = gf_log[a];
+    const int idx = (log * power) % 255;
     return gf_exp[idx];
 }
 
 static std::vector<uint8_t> poly_mul(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
     std::vector<uint8_t> out(a.size() + b.size() - 1);
     for (size_t i = 0; i < a.size(); ++i) {
-        if (a[i] == 0) continue;
+        if (a[i] == 0) {
+            continue;
+        }
         for (size_t j = 0; j < b.size(); ++j) {
-            if (b[j] == 0) continue;
-            out[i+j] ^= gf_mul(a[i], b[j]);
+            if (b[j] == 0) {
+                continue;
+            }
+            out[i + j] ^= gf_mul(a[i], b[j]);
         }
     }
     return out;
@@ -67,169 +80,174 @@ std::vector<uint8_t> encode(const std::vector<uint8_t>& msg, int nsym) {
     std::vector<uint8_t> gen = gen_generator_poly(nsym);
     std::vector<uint8_t> parity(nsym, 0);
     for (size_t i = 0; i < msg.size(); ++i) {
-        uint8_t factor = msg[i] ^ parity[0];
-        // 余数寄存器左移
-        for (int j = 0; j < nsym-1; ++j) parity[j] = parity[j+1];
-        parity[nsym-1] = 0;
+        const uint8_t factor = msg[i] ^ parity[0];
+        for (int j = 0; j < nsym - 1; ++j) {
+            parity[j] = parity[j + 1];
+        }
+        parity[nsym - 1] = 0;
         if (factor != 0) {
             for (int j = 0; j < nsym; ++j) {
-                parity[j] ^= gf_mul(gen[j+1], factor);
+                parity[j] ^= gf_mul(gen[j + 1], factor);
             }
         }
     }
     return parity;
 }
 
-// 在 x 点计算多项式值（系数按升幂排列）
-static uint8_t poly_eval(const std::vector<uint8_t>& poly, uint8_t x) {
-    uint8_t y = 0;
-    for (int i = static_cast<int>(poly.size()) - 1; i >= 0; --i) {
-        y = gf_mul(y, x) ^ poly[i];
-    }
-    return y;
-}
-
-// 使用 Berlekamp-Massey 算法由综合项计算错误定位多项式
 static std::vector<uint8_t> berlekamp_massey(const std::vector<uint8_t>& synd, int nsym) {
-    std::vector<uint8_t> C(1,1);
-    std::vector<uint8_t> B(1,1);
-    int L = 0;
+    std::vector<uint8_t> c(1, 1);
+    std::vector<uint8_t> b(1, 1);
+    int l = 0;
     int m = 1;
-    uint8_t b = 1;
+    uint8_t bb = 1;
     for (int n = 0; n < nsym; ++n) {
         uint8_t d = 0;
-        for (int i = 0; i <= L; ++i) {
-            d ^= gf_mul(C[i], synd[n - i]);
+        for (int i = 0; i <= l; ++i) {
+            d ^= gf_mul(c[i], synd[n - i]);
         }
         if (d == 0) {
             ++m;
-        } else if (2 * L <= n) {
-            std::vector<uint8_t> T = C;
-            uint8_t coef = d;
-            uint8_t inv_b = gf_exp[(255 - gf_log[b]) % 255];
-            uint8_t scale = gf_mul(coef, inv_b);
-            // C = C - scale * x^m * B（GF(2^8) 上减法等价于异或）
-            std::vector<uint8_t> scaled(B.size() + m);
-            for (size_t i = 0; i < B.size(); ++i) scaled[i + m] = gf_mul(B[i], scale);
-            C.resize(std::max(C.size(), scaled.size()));
-            for (size_t i = 0; i < scaled.size(); ++i) C[i] ^= scaled[i];
-            L = n + 1 - L;
-            B = T;
-            b = d;
+        } else if (2 * l <= n) {
+            std::vector<uint8_t> t = c;
+            const uint8_t inv_b = gf_exp[(255 - gf_log[bb]) % 255];
+            const uint8_t scale = gf_mul(d, inv_b);
+            std::vector<uint8_t> scaled(b.size() + m);
+            for (size_t i = 0; i < b.size(); ++i) {
+                scaled[i + m] = gf_mul(b[i], scale);
+            }
+            c.resize(std::max(c.size(), scaled.size()));
+            for (size_t i = 0; i < scaled.size(); ++i) {
+                c[i] ^= scaled[i];
+            }
+            l = n + 1 - l;
+            b = t;
+            bb = d;
             m = 1;
         } else {
-            uint8_t coef = d;
-            uint8_t inv_b = gf_exp[(255 - gf_log[b]) % 255];
-            uint8_t scale = gf_mul(coef, inv_b);
-            std::vector<uint8_t> scaled(B.size() + m);
-            for (size_t i = 0; i < B.size(); ++i) scaled[i + m] = gf_mul(B[i], scale);
-            C.resize(std::max(C.size(), scaled.size()));
-            for (size_t i = 0; i < scaled.size(); ++i) C[i] ^= scaled[i];
+            const uint8_t inv_b = gf_exp[(255 - gf_log[bb]) % 255];
+            const uint8_t scale = gf_mul(d, inv_b);
+            std::vector<uint8_t> scaled(b.size() + m);
+            for (size_t i = 0; i < b.size(); ++i) {
+                scaled[i + m] = gf_mul(b[i], scale);
+            }
+            c.resize(std::max(c.size(), scaled.size()));
+            for (size_t i = 0; i < scaled.size(); ++i) {
+                c[i] ^= scaled[i];
+            }
             ++m;
         }
     }
-    return C;
+    return c;
 }
 
 static std::vector<int> find_error_locations(const std::vector<uint8_t>& err_loc) {
     std::vector<int> locs;
-    int errs = static_cast<int>(err_loc.size()) - 1;
+    const int errs = static_cast<int>(err_loc.size()) - 1;
     for (int i = 0; i < 255; ++i) {
-        uint8_t x = gf_exp[i];
-        uint8_t y = 0;
-        // 在 x^{-1} 处计算 err_loc
-        uint8_t xi = gf_exp[(255 - i) % 255];
-        // Horner 法求值
+        const uint8_t xi = gf_exp[(255 - i) % 255];
         uint8_t sum = 0;
         for (int j = static_cast<int>(err_loc.size()) - 1; j >= 0; --j) {
             sum = gf_mul(sum, xi) ^ err_loc[j];
         }
         if (sum == 0) {
-            // 错误位置为 (255 - i)
             locs.push_back(255 - i);
-            if ((int)locs.size() == errs) break;
+            if (static_cast<int>(locs.size()) == errs) {
+                break;
+            }
         }
     }
     return locs;
 }
 
-static std::vector<uint8_t> calc_error_evaluator(const std::vector<uint8_t>& synd, const std::vector<uint8_t>& err_loc, int nsym) {
-    // 计算 omega(x) = [synd(x) * err_loc(x)] mod x^nsym
+static std::vector<uint8_t> calc_error_evaluator(
+    const std::vector<uint8_t>& synd,
+    const std::vector<uint8_t>& err_loc,
+    int nsym) {
     std::vector<uint8_t> prod = poly_mul(synd, err_loc);
     prod.resize(nsym);
     return prod;
 }
 
 static uint8_t gf_inverse(uint8_t a) {
-    if (a == 0) return 0;
+    if (a == 0) {
+        return 0;
+    }
     return gf_exp[255 - gf_log[a]];
 }
 
 bool decode(std::vector<uint8_t>& codeword, int nsym) {
     init_tables();
     const int n = static_cast<int>(codeword.size());
-    if (nsym <= 0 || nsym >= n) return false;
-    // 计算综合项 S1..S_nsym
+    if (nsym <= 0 || nsym >= n) {
+        return false;
+    }
+
     std::vector<uint8_t> synd(nsym);
     bool all_zero = true;
     for (int i = 0; i < nsym; ++i) {
         uint8_t s = 0;
-        uint8_t x = gf_exp[i]; // α^{i}
+        const uint8_t x = gf_exp[i];
         for (int j = 0; j < n; ++j) {
             s = gf_mul(s, x) ^ codeword[j];
         }
         synd[i] = s;
-        if (s != 0) all_zero = false;
+        if (s != 0) {
+            all_zero = false;
+        }
     }
-    if (all_zero) return true;
+    if (all_zero) {
+        return true;
+    }
 
-    // 构造综合多项式（升幂）
-    std::vector<uint8_t> synd_poly = synd; // synd[0] 对应 S1
-
-    // 使用 Berlekamp-Massey 求错误定位多项式
+    std::vector<uint8_t> synd_poly = synd;
     std::vector<uint8_t> err_loc = berlekamp_massey(synd_poly, nsym);
-    int errs = static_cast<int>(err_loc.size()) - 1;
-    if (errs * 2 > nsym) return false;
+    const int errs = static_cast<int>(err_loc.size()) - 1;
+    if (errs * 2 > nsym) {
+        return false;
+    }
 
-    // 查找错误位置
     std::vector<int> pos = find_error_locations(err_loc);
-    if (pos.empty()) return false;
+    if (pos.empty()) {
+        return false;
+    }
 
-    // 计算错误求值多项式
     std::vector<uint8_t> err_eval = calc_error_evaluator(synd_poly, err_loc, nsym);
 
-    // 使用 Forney 算法计算错误幅值
     for (size_t i = 0; i < pos.size(); ++i) {
-        int position = pos[i];
-        int xi_inv = (255 - position) % 255; // α^{-position}
-        uint8_t x = gf_exp[xi_inv];
+        const int position = pos[i];
+        const int xi_inv = (255 - position) % 255;
+        const uint8_t x = gf_exp[xi_inv];
 
-        // 计算 err_loc_prime(x)
         uint8_t denom = 0;
         for (int j = 1; j < static_cast<int>(err_loc.size()); ++j) {
             denom ^= gf_mul(err_loc[j], gf_pow(x, j));
         }
-        if (denom == 0) return false;
+        if (denom == 0) {
+            return false;
+        }
 
-        // 在 x 处计算 err_eval
         uint8_t y = 0;
         for (int j = static_cast<int>(err_eval.size()) - 1; j >= 0; --j) {
             y = gf_mul(y, x) ^ err_eval[j];
         }
-        uint8_t magnitude = gf_mul(y, gf_inverse(denom));
+        const uint8_t magnitude = gf_mul(y, gf_inverse(denom));
 
-        // 应用纠错：将位置映射到 codeword 下标
-        int idx = n - 1 - position;
-        if (idx < 0 || idx >= n) return false;
+        const int idx = n - 1 - position;
+        if (idx < 0 || idx >= n) {
+            return false;
+        }
         codeword[idx] ^= magnitude;
     }
 
-    // 校验综合项是否全部归零
     for (int i = 0; i < nsym; ++i) {
         uint8_t s = 0;
-        uint8_t x = gf_exp[i];
-        for (int j = 0; j < n; ++j) s = gf_mul(s, x) ^ codeword[j];
-        if (s != 0) return false;
+        const uint8_t x = gf_exp[i];
+        for (int j = 0; j < n; ++j) {
+            s = gf_mul(s, x) ^ codeword[j];
+        }
+        if (s != 0) {
+            return false;
+        }
     }
     return true;
 }
