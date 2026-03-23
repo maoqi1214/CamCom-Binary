@@ -1,4 +1,4 @@
-// CRC32 implementation used across the project.
+// 实现编码端与解码端共用的 CRC32 计算逻辑。
 #include "common.hpp"
 
 #include <mutex>

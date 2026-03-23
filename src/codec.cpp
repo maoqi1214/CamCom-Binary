@@ -1,8 +1,9 @@
-// Rendering, perspective correction, and grid sampling for visual frames.
+// 实现可视化帧渲染、定位点检测、透视矫正与网格采样逻辑。
 #include "codec.hpp"
 #include "common.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <string>
@@ -10,6 +11,47 @@
 
 namespace camcom {
 namespace {
+
+bool find_corner_markers(const cv::Mat& aligned, std::array<cv::Rect, 4>& markers);
+
+bool has_raw_layout_corners(const cv::Mat& frame, const EncoderConfig& cfg) {
+    if (frame.empty() || frame.cols <= 0 || frame.rows <= 0) {
+        return false;
+    }
+
+    const int patch_w = std::max(1, cfg.cell_size);
+    const int patch_h = std::max(1, cfg.cell_size);
+    const std::array<cv::Rect, 4> corner_patches = {
+        cv::Rect(0, 0, std::min(patch_w, frame.cols), std::min(patch_h, frame.rows)),
+        cv::Rect(std::max(0, frame.cols - patch_w), 0, std::min(patch_w, frame.cols), std::min(patch_h, frame.rows)),
+        cv::Rect(0, std::max(0, frame.rows - patch_h), std::min(patch_w, frame.cols), std::min(patch_h, frame.rows)),
+        cv::Rect(
+            std::max(0, frame.cols - patch_w),
+            std::max(0, frame.rows - patch_h),
+            std::min(patch_w, frame.cols),
+            std::min(patch_h, frame.rows)),
+    };
+
+    for (const auto& patch : corner_patches) {
+        if (patch.width <= 0 || patch.height <= 0) {
+            return false;
+        }
+        const cv::Scalar mean = cv::mean(frame(patch));
+        const double intensity = (mean[0] + mean[1] + mean[2]) / 3.0;
+        if (intensity > 64.0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+struct FinderCandidate {
+    double area = 0.0;
+    double score = 0.0;
+    cv::Point2f center;
+    cv::RotatedRect rect;
+    std::array<cv::Point2f, 4> box{};
+};
 
 int color_distance_sq(const cv::Scalar& a, const cv::Scalar& b) {
     const int db = static_cast<int>(a[0] - b[0]);
@@ -54,7 +96,516 @@ double quad_score(
     return area - 800.0 * edge_balance - 1200.0 * orthogonality;
 }
 
-bool warp_with_finders(const cv::Mat& src, cv::Mat& warped) {
+std::array<cv::Point2f, 4> order_quad_points(const std::vector<cv::Point2f>& points) {
+    std::array<cv::Point2f, 4> ordered{};
+    std::vector<cv::Point2f> pts = points;
+    std::sort(pts.begin(), pts.end(), [](const cv::Point2f& lhs, const cv::Point2f& rhs) {
+        return lhs.y == rhs.y ? lhs.x < rhs.x : lhs.y < rhs.y;
+    });
+
+    ordered[0] = pts[0].x < pts[1].x ? pts[0] : pts[1];
+    ordered[1] = pts[0].x < pts[1].x ? pts[1] : pts[0];
+    ordered[2] = pts[2].x < pts[3].x ? pts[2] : pts[3];
+    ordered[3] = pts[2].x < pts[3].x ? pts[3] : pts[2];
+    return ordered;
+}
+
+std::array<cv::Point2f, 4> order_rect_points(const cv::RotatedRect& rect) {
+    cv::Point2f raw[4];
+    rect.points(raw);
+    return order_quad_points({raw[0], raw[1], raw[2], raw[3]});
+}
+
+bool is_square_like(const cv::Size2f& size, double min_aspect = 0.65, double max_aspect = 1.35) {
+    const double w = std::max(1.0f, size.width);
+    const double h = std::max(1.0f, size.height);
+    const double aspect = std::max(w, h) / std::min(w, h);
+    return aspect >= min_aspect && aspect <= max_aspect;
+}
+
+void expected_canvas_size(const EncoderConfig& cfg, int& target_w, int& target_h) {
+    const int frame_header_bytes = 4 + 1 + 4 + 4 + 4 + 4;
+    const int max_codeword_bytes = frame_header_bytes + cfg.payload_bytes_per_frame;
+    const int max_cells = max_codeword_bytes * 4;
+    const int max_rows = std::max(1, (max_cells + cfg.cells_per_row - 1) / cfg.cells_per_row);
+    target_w = (cfg.cells_per_row + 2 * FINDER_MARKER_CELLS) * cfg.cell_size;
+    target_h = (max_rows + 2 * FINDER_MARKER_CELLS) * cfg.cell_size;
+}
+
+cv::Rect clamp_rect_to_image(const cv::Rect& rect, const cv::Size& image_size) {
+    const cv::Rect bounds(0, 0, image_size.width, image_size.height);
+    return rect & bounds;
+}
+
+bool detect_finder_candidates(const cv::Mat& src, std::vector<FinderCandidate>& out) {
+    if (src.empty()) {
+        return false;
+    }
+
+    cv::Mat gray;
+    if (src.channels() == 3) {
+        cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
+    } else {
+        gray = src;
+    }
+    cv::GaussianBlur(gray, gray, cv::Size(5, 5), 0.0);
+
+    const double min_area = std::max(100.0, src.total() * 0.00025);
+    std::vector<FinderCandidate> candidates;
+    candidates.reserve(24);
+
+    auto append_outer_dark_candidates = [&](const cv::Mat& mask) {
+        std::vector<std::vector<cv::Point>> contours;
+        std::vector<cv::Vec4i> hierarchy;
+        cv::findContours(mask, contours, hierarchy, cv::RETR_TREE, cv::CHAIN_APPROX_SIMPLE);
+        if (contours.empty() || hierarchy.empty()) {
+            return;
+        }
+
+        for (int i = 0; i < static_cast<int>(contours.size()); ++i) {
+            const int child = hierarchy[i][2];
+            if (child < 0) {
+                continue;
+            }
+            const int grand_child = hierarchy[child][2];
+            if (grand_child < 0) {
+                continue;
+            }
+
+            const double outer_area = std::abs(cv::contourArea(contours[i]));
+            const double child_area = std::abs(cv::contourArea(contours[child]));
+            const double grand_area = std::abs(cv::contourArea(contours[grand_child]));
+            if (outer_area < min_area || child_area <= 0.0 || grand_area <= 0.0) {
+                continue;
+            }
+
+            const cv::RotatedRect outer_rect = cv::minAreaRect(contours[i]);
+            const cv::RotatedRect child_rect = cv::minAreaRect(contours[child]);
+            const cv::RotatedRect grand_rect = cv::minAreaRect(contours[grand_child]);
+            if (!is_square_like(outer_rect.size) ||
+                !is_square_like(child_rect.size, 0.55, 1.45) ||
+                !is_square_like(grand_rect.size, 0.55, 1.45)) {
+                continue;
+            }
+
+            const double outer_side =
+                (std::max(outer_rect.size.width, 1.0f) + std::max(outer_rect.size.height, 1.0f)) * 0.5;
+            const double child_side =
+                (std::max(child_rect.size.width, 1.0f) + std::max(child_rect.size.height, 1.0f)) * 0.5;
+            const double grand_side =
+                (std::max(grand_rect.size.width, 1.0f) + std::max(grand_rect.size.height, 1.0f)) * 0.5;
+
+            const double outer_to_child = outer_side / std::max(1.0, child_side);
+            const double child_to_grand = child_side / std::max(1.0, grand_side);
+            const double center_offset =
+                cv::norm(outer_rect.center - child_rect.center) / std::max(1.0, outer_side) +
+                cv::norm(outer_rect.center - grand_rect.center) / std::max(1.0, outer_side);
+            const double child_fill = child_area / std::max(1.0, outer_area);
+            const double grand_fill = grand_area / std::max(1.0, outer_area);
+            const double rect_fill = outer_area /
+                std::max(1.0, static_cast<double>(outer_rect.size.width) * outer_rect.size.height);
+
+            const bool sane =
+                outer_to_child >= 1.20 && outer_to_child <= 1.70 &&
+                child_to_grand >= 1.35 && child_to_grand <= 2.20 &&
+                center_offset <= 0.35 &&
+                child_fill >= 0.22 && child_fill <= 0.70 &&
+                grand_fill >= 0.04 && grand_fill <= 0.38 &&
+                rect_fill >= 0.35 && rect_fill <= 1.15;
+            if (!sane) {
+                continue;
+            }
+
+            const double ratio_penalty =
+                std::abs(outer_to_child - (7.0 / 5.0)) +
+                std::abs(child_to_grand - (5.0 / 3.0));
+            FinderCandidate candidate;
+            candidate.area = outer_area;
+            candidate.center = outer_rect.center;
+            candidate.rect = outer_rect;
+            candidate.box = order_rect_points(outer_rect);
+            candidate.score = outer_area - 1800.0 * ratio_penalty - 2200.0 * center_offset;
+            candidates.push_back(candidate);
+        }
+    };
+
+    auto append_inner_white_candidates = [&](const cv::Mat& mask) {
+        std::vector<std::vector<cv::Point>> contours;
+        std::vector<cv::Vec4i> hierarchy;
+        cv::findContours(mask, contours, hierarchy, cv::RETR_TREE, cv::CHAIN_APPROX_SIMPLE);
+        if (contours.empty() || hierarchy.empty()) {
+            return;
+        }
+
+        for (int i = 0; i < static_cast<int>(contours.size()); ++i) {
+            const int child = hierarchy[i][2];
+            if (child < 0) {
+                continue;
+            }
+
+            const double inner_area = std::abs(cv::contourArea(contours[i]));
+            const double center_area = std::abs(cv::contourArea(contours[child]));
+            if (inner_area < min_area * 0.30 || center_area <= 0.0) {
+                continue;
+            }
+
+            const cv::RotatedRect inner_rect = cv::minAreaRect(contours[i]);
+            const cv::RotatedRect center_rect = cv::minAreaRect(contours[child]);
+            if (!is_square_like(inner_rect.size, 0.60, 1.40) ||
+                !is_square_like(center_rect.size, 0.60, 1.40)) {
+                continue;
+            }
+
+            const double inner_side =
+                (std::max(inner_rect.size.width, 1.0f) + std::max(inner_rect.size.height, 1.0f)) * 0.5;
+            const double center_side =
+                (std::max(center_rect.size.width, 1.0f) + std::max(center_rect.size.height, 1.0f)) * 0.5;
+            const double inner_to_center = inner_side / std::max(1.0, center_side);
+            const double center_offset =
+                cv::norm(inner_rect.center - center_rect.center) / std::max(1.0, inner_side);
+            const double center_fill = center_area / std::max(1.0, inner_area);
+
+            const bool sane =
+                inner_to_center >= 1.35 && inner_to_center <= 2.20 &&
+                center_offset <= 0.20 &&
+                center_fill >= 0.15 && center_fill <= 0.55;
+            if (!sane) {
+                continue;
+            }
+
+            const float expand = 7.0f / 5.0f;
+            cv::RotatedRect full_rect(
+                inner_rect.center,
+                cv::Size2f(inner_rect.size.width * expand, inner_rect.size.height * expand),
+                inner_rect.angle);
+            FinderCandidate candidate;
+            candidate.area = inner_area * expand * expand;
+            candidate.center = full_rect.center;
+            candidate.rect = full_rect;
+            candidate.box = order_rect_points(full_rect);
+            candidate.score = candidate.area -
+                1800.0 * std::abs(inner_to_center - (5.0 / 3.0)) -
+                2200.0 * center_offset;
+            candidates.push_back(candidate);
+        }
+    };
+
+    cv::Mat dark_mask;
+    cv::threshold(gray, dark_mask, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
+    append_outer_dark_candidates(dark_mask);
+
+    cv::Mat bright_mask;
+    cv::threshold(gray, bright_mask, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
+    append_inner_white_candidates(bright_mask);
+
+    if (candidates.empty()) {
+        return false;
+    }
+
+    std::sort(candidates.begin(), candidates.end(), [](const FinderCandidate& lhs, const FinderCandidate& rhs) {
+        return lhs.score > rhs.score;
+    });
+
+    out.clear();
+    out.reserve(std::min<size_t>(candidates.size(), 16));
+    for (const auto& candidate : candidates) {
+        const double candidate_side = std::max(candidate.rect.size.width, candidate.rect.size.height);
+        bool duplicate = false;
+        for (const auto& kept : out) {
+            const double kept_side = std::max(kept.rect.size.width, kept.rect.size.height);
+            const double distance = cv::norm(candidate.center - kept.center);
+            if (distance < std::max(candidate_side, kept_side) * 0.40) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) {
+            out.push_back(candidate);
+        }
+        if (out.size() >= 16) {
+            break;
+        }
+    }
+    return out.size() >= 4;
+}
+
+bool select_finder_quad(
+    const std::vector<FinderCandidate>& candidates,
+    std::array<FinderCandidate, 4>& ordered_quad) {
+    if (candidates.size() < 4) {
+        return false;
+    }
+
+    std::vector<FinderCandidate> pool = candidates;
+    if (pool.size() > 12) {
+        pool.resize(12);
+    }
+
+    bool found = false;
+    double best_score = -std::numeric_limits<double>::infinity();
+    std::array<FinderCandidate, 4> best_quad{};
+
+    for (int a = 0; a < static_cast<int>(pool.size()); ++a) {
+        for (int b = a + 1; b < static_cast<int>(pool.size()); ++b) {
+            for (int c = b + 1; c < static_cast<int>(pool.size()); ++c) {
+                for (int d = c + 1; d < static_cast<int>(pool.size()); ++d) {
+                    std::array<FinderCandidate, 4> quad = {
+                        pool[a], pool[b], pool[c], pool[d],
+                    };
+                    std::sort(quad.begin(), quad.end(), [](const FinderCandidate& lhs, const FinderCandidate& rhs) {
+                        return lhs.center.y == rhs.center.y ? lhs.center.x < rhs.center.x : lhs.center.y < rhs.center.y;
+                    });
+
+                    const FinderCandidate tl = quad[0].center.x < quad[1].center.x ? quad[0] : quad[1];
+                    const FinderCandidate tr = quad[0].center.x < quad[1].center.x ? quad[1] : quad[0];
+                    const FinderCandidate bl = quad[2].center.x < quad[3].center.x ? quad[2] : quad[3];
+                    const FinderCandidate br = quad[2].center.x < quad[3].center.x ? quad[3] : quad[2];
+
+                    if (tl.center.x >= tr.center.x || bl.center.x >= br.center.x ||
+                        tl.center.y >= bl.center.y || tr.center.y >= br.center.y) {
+                        continue;
+                    }
+
+                    const double top_w = cv::norm(tr.center - tl.center);
+                    const double bottom_w = cv::norm(br.center - bl.center);
+                    const double left_h = cv::norm(bl.center - tl.center);
+                    const double right_h = cv::norm(br.center - tr.center);
+                    const double min_edge = std::min({top_w, bottom_w, left_h, right_h});
+                    if (min_edge < 10.0) {
+                        continue;
+                    }
+
+                    const double mean_side =
+                        (std::max(tl.rect.size.width, tl.rect.size.height) +
+                         std::max(tr.rect.size.width, tr.rect.size.height) +
+                         std::max(bl.rect.size.width, bl.rect.size.height) +
+                         std::max(br.rect.size.width, br.rect.size.height)) * 0.25;
+                    const double size_range =
+                        std::max({std::max(tl.rect.size.width, tl.rect.size.height),
+                                  std::max(tr.rect.size.width, tr.rect.size.height),
+                                  std::max(bl.rect.size.width, bl.rect.size.height),
+                                  std::max(br.rect.size.width, br.rect.size.height)}) -
+                        std::min({std::max(tl.rect.size.width, tl.rect.size.height),
+                                  std::max(tr.rect.size.width, tr.rect.size.height),
+                                  std::max(bl.rect.size.width, bl.rect.size.height),
+                                  std::max(br.rect.size.width, br.rect.size.height)});
+
+                    const double score =
+                        quad_score(tl.center, tr.center, bl.center, br.center) +
+                        tl.score + tr.score + bl.score + br.score -
+                        1800.0 * (size_range / std::max(1.0, mean_side));
+                    if (!found || score > best_score) {
+                        found = true;
+                        best_score = score;
+                        best_quad = {tl, tr, bl, br};
+                    }
+                }
+            }
+        }
+    }
+
+    if (!found) {
+        return false;
+    }
+
+    ordered_quad = best_quad;
+    return true;
+}
+
+bool quad_is_corner_aligned(
+    const std::array<FinderCandidate, 4>& quad,
+    const cv::Size& image_size,
+    double margin_frac = 0.30) {
+    const double margin_x = image_size.width * margin_frac;
+    const double margin_y = image_size.height * margin_frac;
+
+    return
+        quad[0].center.x <= margin_x && quad[0].center.y <= margin_y &&
+        quad[1].center.x >= image_size.width - margin_x && quad[1].center.y <= margin_y &&
+        quad[2].center.x <= margin_x && quad[2].center.y >= image_size.height - margin_y &&
+        quad[3].center.x >= image_size.width - margin_x && quad[3].center.y >= image_size.height - margin_y;
+}
+
+bool warp_from_quad_points(
+    const cv::Mat& src,
+    const std::array<cv::Point2f, 4>& quad,
+    const EncoderConfig& cfg,
+    cv::Mat& warped) {
+    int target_w = 0;
+    int target_h = 0;
+    expected_canvas_size(cfg, target_w, target_h);
+    if (target_w <= 0 || target_h <= 0) {
+        return false;
+    }
+
+    const std::vector<cv::Point2f> src_pts = {
+        quad[0],
+        quad[1],
+        quad[2],
+        quad[3],
+    };
+    const std::vector<cv::Point2f> dst_pts = {
+        cv::Point2f(0.0f, 0.0f),
+        cv::Point2f(static_cast<float>(target_w - 1), 0.0f),
+        cv::Point2f(0.0f, static_cast<float>(target_h - 1)),
+        cv::Point2f(static_cast<float>(target_w - 1), static_cast<float>(target_h - 1)),
+    };
+
+    const cv::Mat transform = cv::getPerspectiveTransform(src_pts, dst_pts);
+    cv::warpPerspective(src, warped, transform, cv::Size(target_w, target_h));
+    return !warped.empty();
+}
+
+std::array<cv::Point2f, 4> quad_points_from_finder_quad(const std::array<FinderCandidate, 4>& quad) {
+    return {
+        quad[0].box[0],
+        quad[1].box[1],
+        quad[2].box[2],
+        quad[3].box[3],
+    };
+}
+
+bool warp_from_finder_quad(
+    const cv::Mat& src,
+    const std::array<FinderCandidate, 4>& quad,
+    const EncoderConfig& cfg,
+    cv::Mat& warped) {
+    return warp_from_quad_points(src, quad_points_from_finder_quad(quad), cfg, warped);
+}
+
+bool warp_with_structured_finders(const cv::Mat& src, cv::Mat& warped, const EncoderConfig& cfg) {
+    std::vector<FinderCandidate> candidates;
+    std::array<FinderCandidate, 4> quad{};
+    if (!detect_finder_candidates(src, candidates) || !select_finder_quad(candidates, quad)) {
+        return false;
+    }
+    if (!warp_from_finder_quad(src, quad, cfg, warped)) {
+        return false;
+    }
+
+    std::vector<FinderCandidate> refined_candidates;
+    std::array<FinderCandidate, 4> refined_quad{};
+    if (detect_finder_candidates(warped, refined_candidates) &&
+        select_finder_quad(refined_candidates, refined_quad) &&
+        quad_is_corner_aligned(refined_quad, warped.size())) {
+        cv::Mat refined;
+        if (warp_from_finder_quad(warped, refined_quad, cfg, refined)) {
+            warped = std::move(refined);
+        }
+    }
+    return true;
+}
+
+bool warp_with_canvas_quad(const cv::Mat& src, cv::Mat& warped, const EncoderConfig& cfg) {
+    cv::Mat gray;
+    if (src.channels() == 3) {
+        cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
+    } else {
+        gray = src;
+    }
+    cv::GaussianBlur(gray, gray, cv::Size(5, 5), 0);
+
+    cv::Mat bin;
+    cv::threshold(gray, bin, 72, 255, cv::THRESH_BINARY);
+    cv::morphologyEx(
+        bin,
+        bin,
+        cv::MORPH_CLOSE,
+        cv::getStructuringElement(cv::MORPH_RECT, cv::Size(11, 11)));
+
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(bin, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+    int target_w = 0;
+    int target_h = 0;
+    expected_canvas_size(cfg, target_w, target_h);
+    const double target_aspect = static_cast<double>(target_w) / static_cast<double>(target_h);
+
+    double best_area = 0.0;
+    std::array<cv::Point2f, 4> best_quad{};
+    bool found = false;
+
+    for (const auto& contour : contours) {
+        const double area = cv::contourArea(contour);
+        if (area < src.total() * 0.08) {
+            continue;
+        }
+
+        std::vector<cv::Point> poly;
+        cv::approxPolyDP(contour, poly, 0.02 * cv::arcLength(contour, true), true);
+        if (poly.size() != 4) {
+            continue;
+        }
+
+        std::vector<cv::Point2f> quad;
+        quad.reserve(4);
+        for (const auto& p : poly) {
+            quad.push_back(cv::Point2f(static_cast<float>(p.x), static_cast<float>(p.y)));
+        }
+        const auto ordered = order_quad_points(quad);
+        const double w1 = cv::norm(ordered[1] - ordered[0]);
+        const double w2 = cv::norm(ordered[3] - ordered[2]);
+        const double h1 = cv::norm(ordered[2] - ordered[0]);
+        const double h2 = cv::norm(ordered[3] - ordered[1]);
+        const double aspect =
+            std::max(w1, w2) / std::max(1.0, std::max(h1, h2));
+        if (aspect < target_aspect * 0.75 || aspect > target_aspect * 1.25) {
+            continue;
+        }
+
+        if (area > best_area) {
+            best_area = area;
+            best_quad = ordered;
+            found = true;
+        }
+    }
+
+    if (!found) {
+        return false;
+    }
+
+    const std::vector<cv::Point2f> dst = {
+        cv::Point2f(0.0f, 0.0f),
+        cv::Point2f(static_cast<float>(target_w - 1), 0.0f),
+        cv::Point2f(0.0f, static_cast<float>(target_h - 1)),
+        cv::Point2f(static_cast<float>(target_w - 1), static_cast<float>(target_h - 1)),
+    };
+    const cv::Mat transform = cv::getPerspectiveTransform(
+        std::vector<cv::Point2f>{best_quad[0], best_quad[1], best_quad[2], best_quad[3]},
+        dst);
+    cv::warpPerspective(src, warped, transform, cv::Size(target_w, target_h));
+
+    std::array<cv::Rect, 4> markers{};
+    if (find_corner_markers(warped, markers)) {
+        const std::vector<cv::Point2f> refined_src = {
+            cv::Point2f(static_cast<float>(markers[0].x), static_cast<float>(markers[0].y)),
+            cv::Point2f(static_cast<float>(markers[1].x + markers[1].width - 1), static_cast<float>(markers[1].y)),
+            cv::Point2f(static_cast<float>(markers[2].x), static_cast<float>(markers[2].y + markers[2].height - 1)),
+            cv::Point2f(
+                static_cast<float>(markers[3].x + markers[3].width - 1),
+                static_cast<float>(markers[3].y + markers[3].height - 1)),
+        };
+        const std::vector<cv::Point2f> refined_dst = {
+            cv::Point2f(0.0f, 0.0f),
+            cv::Point2f(static_cast<float>(target_w - 1), 0.0f),
+            cv::Point2f(0.0f, static_cast<float>(target_h - 1)),
+            cv::Point2f(static_cast<float>(target_w - 1), static_cast<float>(target_h - 1)),
+        };
+        cv::Mat refined;
+        const cv::Mat refine_transform = cv::getPerspectiveTransform(refined_src, refined_dst);
+        cv::warpPerspective(warped, refined, refine_transform, cv::Size(target_w, target_h));
+        if (!refined.empty()) {
+            warped = std::move(refined);
+        }
+    }
+    return true;
+}
+
+bool warp_with_finders(const cv::Mat& src, cv::Mat& warped, const EncoderConfig& cfg) {
+    if (warp_with_structured_finders(src, warped, cfg)) {
+        return true;
+    }
+
     cv::Mat gray;
     if (src.channels() == 3) {
         cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
@@ -196,35 +747,247 @@ bool warp_with_finders(const cv::Mat& src, cv::Mat& warped) {
     const double w2 = cv::norm(br - bl);
     const double h1 = cv::norm(bl - tl);
     const double h2 = cv::norm(br - tr);
-    const double target = std::max({w1, w2, h1, h2});
-    if (target < 1.0) {
+    const double target_w = std::max(w1, w2);
+    const double target_h = std::max(h1, h2);
+    if (target_w < 1.0 || target_h < 1.0) {
         return false;
     }
 
-    const int dst_size = static_cast<int>(std::ceil(target));
+    const int dst_w = static_cast<int>(std::ceil(target_w));
+    const int dst_h = static_cast<int>(std::ceil(target_h));
     std::vector<cv::Point2f> dst = {
         cv::Point2f(0.0f, 0.0f),
-        cv::Point2f(static_cast<float>(dst_size - 1), 0.0f),
-        cv::Point2f(0.0f, static_cast<float>(dst_size - 1)),
-        cv::Point2f(static_cast<float>(dst_size - 1), static_cast<float>(dst_size - 1)),
+        cv::Point2f(static_cast<float>(dst_w - 1), 0.0f),
+        cv::Point2f(0.0f, static_cast<float>(dst_h - 1)),
+        cv::Point2f(static_cast<float>(dst_w - 1), static_cast<float>(dst_h - 1)),
     };
 
     const cv::Mat transform =
         cv::getPerspectiveTransform(std::vector<cv::Point2f>{tl, tr, bl, br}, dst);
-    cv::warpPerspective(src, warped, transform, cv::Size(dst_size, dst_size));
+    cv::warpPerspective(src, warped, transform, cv::Size(dst_w, dst_h));
     return true;
 }
 
-cv::Mat center_crop_square(const cv::Mat& src) {
-    const int side = std::min(src.cols, src.rows);
-    const int x = (src.cols - side) / 2;
-    const int y = (src.rows - side) / 2;
-    return src(cv::Rect(x, y, side, side)).clone();
+cv::Mat center_crop_expected_layout(const cv::Mat& src, const EncoderConfig& cfg) {
+    const int payload_cells = cfg.payload_bytes_per_frame * 4;
+    const int rows = std::max(1, (payload_cells + cfg.cells_per_row - 1) / cfg.cells_per_row);
+    const int expected_w_cells = cfg.cells_per_row + 2 * FINDER_MARKER_CELLS;
+    const int expected_h_cells = rows + 2 * FINDER_MARKER_CELLS;
+    const double expected_aspect =
+        static_cast<double>(expected_w_cells) / static_cast<double>(expected_h_cells);
+
+    int crop_w = src.cols;
+    int crop_h = static_cast<int>(std::round(crop_w / expected_aspect));
+    if (crop_h > src.rows) {
+        crop_h = src.rows;
+        crop_w = static_cast<int>(std::round(crop_h * expected_aspect));
+    }
+
+    crop_w = std::clamp(crop_w, 1, src.cols);
+    crop_h = std::clamp(crop_h, 1, src.rows);
+
+    const int x = std::max(0, (src.cols - crop_w) / 2);
+    const int y = std::max(0, (src.rows - crop_h) / 2);
+    return src(cv::Rect(x, y, crop_w, crop_h)).clone();
+}
+
+bool find_corner_markers(
+    const cv::Mat& aligned,
+    std::array<cv::Rect, 4>& markers) {
+    if (aligned.empty()) {
+        return false;
+    }
+
+    std::vector<FinderCandidate> candidates;
+    std::array<FinderCandidate, 4> quad{};
+    if (detect_finder_candidates(aligned, candidates) &&
+        select_finder_quad(candidates, quad) &&
+        quad_is_corner_aligned(quad, aligned.size())) {
+        for (int i = 0; i < 4; ++i) {
+            markers[i] = clamp_rect_to_image(quad[i].rect.boundingRect(), aligned.size());
+            if (markers[i].empty()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    cv::Mat gray;
+    if (aligned.channels() == 3) {
+        cv::cvtColor(aligned, gray, cv::COLOR_BGR2GRAY);
+    } else {
+        gray = aligned;
+    }
+    cv::GaussianBlur(gray, gray, cv::Size(5, 5), 0.0);
+
+    cv::Mat dark_mask;
+    cv::threshold(gray, dark_mask, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
+
+    const int roi_w = std::max(32, aligned.cols / 4);
+    const int roi_h = std::max(32, aligned.rows / 4);
+    const int min_side = std::max(8, std::min(aligned.cols, aligned.rows) / 40);
+
+    struct CornerRoi {
+        cv::Rect roi;
+        cv::Point2f expected_center;
+    };
+
+    const std::array<CornerRoi, 4> rois = {{
+        {cv::Rect(0, 0, roi_w, roi_h), cv::Point2f(roi_w * 0.22f, roi_h * 0.22f)},
+        {cv::Rect(aligned.cols - roi_w, 0, roi_w, roi_h), cv::Point2f(aligned.cols - roi_w * 0.22f, roi_h * 0.22f)},
+        {cv::Rect(0, aligned.rows - roi_h, roi_w, roi_h), cv::Point2f(roi_w * 0.22f, aligned.rows - roi_h * 0.22f)},
+        {cv::Rect(aligned.cols - roi_w, aligned.rows - roi_h, roi_w, roi_h),
+         cv::Point2f(aligned.cols - roi_w * 0.22f, aligned.rows - roi_h * 0.22f)},
+    }};
+
+    for (int corner = 0; corner < 4; ++corner) {
+        const cv::Rect roi = rois[corner].roi;
+        cv::Mat roi_mask = dark_mask(roi);
+
+        std::vector<std::vector<cv::Point>> contours;
+        cv::findContours(roi_mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+        double best_score = -1.0;
+        cv::Rect best_rect;
+        for (const auto& contour : contours) {
+            const double area = cv::contourArea(contour);
+            if (area < static_cast<double>(min_side * min_side)) {
+                continue;
+            }
+
+            const cv::Rect local = cv::boundingRect(contour);
+            if (local.width < min_side || local.height < min_side) {
+                continue;
+            }
+
+            const double aspect =
+                static_cast<double>(local.width) / std::max(1.0, static_cast<double>(local.height));
+            if (aspect < 0.60 || aspect > 1.40) {
+                continue;
+            }
+
+            const double fill_ratio =
+                area / std::max(1.0, static_cast<double>(local.width * local.height));
+            if (fill_ratio < 0.20 || fill_ratio > 0.90) {
+                continue;
+            }
+
+            const cv::Point2f center(
+                static_cast<float>(roi.x + local.x + local.width * 0.5),
+                static_cast<float>(roi.y + local.y + local.height * 0.5));
+            const double distance = cv::norm(center - rois[corner].expected_center);
+            const double score = area - distance * 18.0;
+            if (score > best_score) {
+                best_score = score;
+                best_rect = cv::Rect(roi.x + local.x, roi.y + local.y, local.width, local.height);
+            }
+        }
+
+        if (best_score < 0.0) {
+            return false;
+        }
+        markers[corner] = best_rect;
+    }
+
+    return true;
+}
+
+bool derive_grid_from_markers(
+    const cv::Mat& aligned,
+    const EncoderConfig& cfg,
+    double& origin_x,
+    double& origin_y,
+    double& cell_w,
+    double& cell_h,
+    int& rows) {
+    std::array<cv::Rect, 4> markers{};
+    if (!find_corner_markers(aligned, markers)) {
+        return false;
+    }
+
+    const double marker_cell_w =
+        (markers[0].width + markers[1].width + markers[2].width + markers[3].width) /
+        (4.0 * FINDER_MARKER_CELLS);
+    const double marker_cell_h =
+        (markers[0].height + markers[1].height + markers[2].height + markers[3].height) /
+        (4.0 * FINDER_MARKER_CELLS);
+
+    origin_x =
+        ((markers[0].x + markers[0].width) + (markers[2].x + markers[2].width)) * 0.5;
+    origin_y =
+        ((markers[0].y + markers[0].height) + (markers[1].y + markers[1].height)) * 0.5;
+
+    const double right_marker_left = (markers[1].x + markers[3].x) * 0.5;
+    const double bottom_marker_top = (markers[2].y + markers[3].y) * 0.5;
+
+    cell_w = (right_marker_left - origin_x) / std::max(1, cfg.cells_per_row);
+    if (cell_w <= 1.0) {
+        cell_w = marker_cell_w;
+    }
+
+    const double row_span = bottom_marker_top - origin_y;
+    if (row_span <= 1.0) {
+        return false;
+    }
+
+    rows = static_cast<int>(std::round(row_span / std::max(1.0, marker_cell_h)));
+    rows = std::max(1, rows);
+    cell_h = row_span / rows;
+    if (cell_h <= 1.0) {
+        cell_h = marker_cell_h;
+    }
+
+    const bool sane =
+        origin_x >= 0.0 &&
+        origin_y >= 0.0 &&
+        cell_w >= 4.0 &&
+        cell_h >= 4.0 &&
+        rows >= 1;
+    return sane;
 }
 
 } // namespace
 
-void render_frame(cv::Mat& out, const std::vector<uint8_t>& payload, const EncoderConfig& cfg) {
+bool detect_frame_quad(
+    const cv::Mat& frame,
+    const EncoderConfig& cfg,
+    std::array<cv::Point2f, 4>& out_quad) {
+    (void)cfg;
+    std::vector<FinderCandidate> candidates;
+    std::array<FinderCandidate, 4> quad{};
+    if (!detect_finder_candidates(frame, candidates) ||
+        !select_finder_quad(candidates, quad) ||
+        !quad_is_corner_aligned(quad, frame.size())) {
+        return false;
+    }
+
+    out_quad = quad_points_from_finder_quad(quad);
+    return true;
+}
+
+bool rectify_frame_with_quad(
+    const cv::Mat& frame,
+    const std::array<cv::Point2f, 4>& quad,
+    const EncoderConfig& cfg,
+    cv::Mat& out_rectified) {
+    return warp_from_quad_points(frame, quad, cfg, out_rectified);
+}
+
+EncoderConfig make_default_encoder_config(int fps) {
+    EncoderConfig cfg;
+    cfg.fps = fps;
+    cfg.cell_size = 16;
+    cfg.cells_per_row = 137;
+    cfg.payload_bytes_per_frame = 2400;
+    cfg.reference_block_size = 2;
+    return cfg;
+}
+
+void render_frame(
+    cv::Mat& out,
+    const std::vector<uint8_t>& payload,
+    const EncoderConfig& cfg,
+    int forced_rows) {
     std::vector<int> cells;
     cells.reserve(payload.size() * 4);
     for (const uint8_t byte : payload) {
@@ -235,7 +998,8 @@ void render_frame(cv::Mat& out, const std::vector<uint8_t>& payload, const Encod
     }
 
     const int total_cells = static_cast<int>(cells.size());
-    const int rows = (total_cells + cfg.cells_per_row - 1) / cfg.cells_per_row;
+    const int payload_rows = std::max(1, (total_cells + cfg.cells_per_row - 1) / cfg.cells_per_row);
+    const int rows = std::max(payload_rows, forced_rows);
     const int marker_px = FINDER_MARKER_CELLS * cfg.cell_size;
     const int data_w = cfg.cells_per_row * cfg.cell_size;
     const int data_h = rows * cfg.cell_size;
@@ -243,7 +1007,7 @@ void render_frame(cv::Mat& out, const std::vector<uint8_t>& payload, const Encod
     const int img_h = data_h + marker_px * 2;
 
     out.create(img_h, img_w, CV_8UC3);
-    out.setTo(cv::Scalar(255, 255, 255));
+    out.setTo(cfg.background_color);
 
     auto draw_finder = [&](int x, int y) {
         cv::rectangle(out, cv::Rect(x, y, marker_px, marker_px), cv::Scalar(0, 0, 0), cv::FILLED);
@@ -251,7 +1015,7 @@ void render_frame(cv::Mat& out, const std::vector<uint8_t>& payload, const Encod
         cv::rectangle(
             out,
             cv::Rect(x + inner, y + inner, marker_px - 2 * inner, marker_px - 2 * inner),
-            cv::Scalar(255, 255, 255),
+            cfg.background_color,
             cv::FILLED);
         const int inner2 = inner * 2;
         cv::rectangle(
@@ -273,7 +1037,7 @@ void render_frame(cv::Mat& out, const std::vector<uint8_t>& payload, const Encod
         cv::rectangle(
             out,
             cv::Rect(x + inner, y + inner, small_marker_px - 2 * inner, small_marker_px - 2 * inner),
-            cv::Scalar(255, 255, 255),
+            cfg.background_color,
             cv::FILLED);
     };
 
@@ -305,30 +1069,62 @@ void render_frame(cv::Mat& out, const std::vector<uint8_t>& payload, const Encod
     }
 }
 
+bool rectify_frame_geometry(const cv::Mat& frame, cv::Mat& out_rectified, const EncoderConfig& cfg) {
+    if (frame.empty()) {
+        return false;
+    }
+
+    const bool exact_raw_layout =
+        frame.cols == (cfg.cells_per_row + 2 * FINDER_MARKER_CELLS) * cfg.cell_size &&
+        has_raw_layout_corners(frame, cfg);
+    if (exact_raw_layout) {
+        out_rectified = frame.clone();
+        return true;
+    }
+
+    if (warp_with_structured_finders(frame, out_rectified, cfg)) {
+        return true;
+    }
+    if (warp_with_canvas_quad(frame, out_rectified, cfg)) {
+        return true;
+    }
+    if (warp_with_finders(frame, out_rectified, cfg)) {
+        return true;
+    }
+    return false;
+}
+
 bool sample_frame(const cv::Mat& frame, std::vector<uint8_t>& out_payload, EncoderConfig& cfg) {
     const bool exact_raw_layout =
-        frame.cols == (cfg.cells_per_row + 2 * FINDER_MARKER_CELLS) * cfg.cell_size;
+        frame.cols == (cfg.cells_per_row + 2 * FINDER_MARKER_CELLS) * cfg.cell_size &&
+        has_raw_layout_corners(frame, cfg);
 
     auto sample_aligned = [&](const cv::Mat& aligned, const char* label) -> bool {
         const int img_w = aligned.cols;
         const int img_h = aligned.rows;
+        const std::string_view mode(label);
 
-        int origin_x = 0;
-        int origin_y = 0;
+        double origin_x = 0.0;
+        double origin_y = 0.0;
         double cell_w = cfg.cell_size;
         double cell_h = cfg.cell_size;
         int rows = 0;
+        const bool marker_layout =
+            (mode == "cropped" || mode == "warped") &&
+            derive_grid_from_markers(aligned, cfg, origin_x, origin_y, cell_w, cell_h, rows);
 
-        if (std::string(label) == "warped") {
+        if (marker_layout) {
+            // Use geometry inferred from the four large finder blocks when available.
+        } else if (mode == "warped") {
             cell_w = static_cast<double>(img_w) / (cfg.cells_per_row + FINDER_MARKER_CELLS);
             cell_h = cell_w;
-            origin_x = static_cast<int>(std::round((FINDER_MARKER_CELLS / 2.0) * cell_w));
-            origin_y = static_cast<int>(std::round((FINDER_MARKER_CELLS / 2.0) * cell_h));
+            origin_x = (FINDER_MARKER_CELLS / 2.0) * cell_w;
+            origin_y = (FINDER_MARKER_CELLS / 2.0) * cell_h;
             rows = static_cast<int>(std::round(img_h / cell_h)) - FINDER_MARKER_CELLS;
-        } else if (std::string(label) == "raw" &&
+        } else if ((mode == "raw" || mode == "aligned") &&
                    img_w == (cfg.cells_per_row + 2 * FINDER_MARKER_CELLS) * cfg.cell_size) {
-            origin_x = FINDER_MARKER_CELLS * cfg.cell_size;
-            origin_y = FINDER_MARKER_CELLS * cfg.cell_size;
+            origin_x = static_cast<double>(FINDER_MARKER_CELLS * cfg.cell_size);
+            origin_y = static_cast<double>(FINDER_MARKER_CELLS * cfg.cell_size);
             rows = (img_h - 2 * FINDER_MARKER_CELLS * cfg.cell_size) / cfg.cell_size;
         } else {
             cv::Mat gray;
@@ -380,18 +1176,21 @@ bool sample_frame(const cv::Mat& frame, std::vector<uint8_t>& out_payload, Encod
                 return false;
             }
 
-            origin_x = std::max(0, col_lo - (col_lo % cfg.cell_size));
-            origin_y = std::max(0, row_lo - (row_lo % cfg.cell_size));
+            origin_x = static_cast<double>(std::max(0, col_lo - (col_lo % cfg.cell_size)));
+            origin_y = static_cast<double>(std::max(0, row_lo - (row_lo % cfg.cell_size)));
             const int data_w = cfg.cells_per_row * cfg.cell_size;
             if (origin_x + data_w > img_w) {
-                origin_x = std::max(0, img_w - data_w);
+                origin_x = static_cast<double>(std::max(0, img_w - data_w));
             }
-            rows = (row_hi - origin_y + 1) / cfg.cell_size;
+            rows = (row_hi - static_cast<int>(origin_y) + 1) / cfg.cell_size;
         }
 
         if (rows <= 0) {
             return false;
         }
+
+        cv::Mat sample_source;
+        cv::GaussianBlur(aligned, sample_source, cv::Size(3, 3), 0.0);
 
         std::array<cv::Scalar, 4> classifier_colors = {
             cfg.colors[0], cfg.colors[1], cfg.colors[2], cfg.colors[3],
@@ -419,7 +1218,7 @@ bool sample_frame(const cv::Mat& frame, std::vector<uint8_t>& out_payload, Encod
 
                 const int inset_x = std::max(1, rw / 4);
                 const int inset_y = std::max(1, rh / 4);
-                observed_refs[k] = cv::mean(aligned(cv::Rect(
+                observed_refs[k] = cv::mean(sample_source(cv::Rect(
                     x0 + inset_x,
                     y0 + inset_y,
                     std::max(1, rw - 2 * inset_x),
@@ -431,9 +1230,41 @@ bool sample_frame(const cv::Mat& frame, std::vector<uint8_t>& out_payload, Encod
             }
         }
 
-        auto build_payload = [&](double ox, double oy, double cw, double ch, int rows_local) {
-            std::vector<int> cells_local;
-            cells_local.reserve(rows_local * cfg.cells_per_row);
+        auto build_payload_candidates = [&](double ox, double oy, double cw, double ch, int rows_local) {
+            std::vector<int> cells_local_chroma;
+            std::vector<int> cells_local_missing;
+            cells_local_chroma.reserve(rows_local * cfg.cells_per_row);
+            cells_local_missing.reserve(rows_local * cfg.cells_per_row);
+
+            const cv::Vec3d black_ref(
+                classifier_colors[0][0],
+                classifier_colors[0][1],
+                classifier_colors[0][2]);
+            std::array<cv::Vec3d, 4> ref_chroma{};
+            std::array<int, 3> missing_channel_to_symbol = {-1, -1, -1};
+            double min_color_energy = std::numeric_limits<double>::max();
+            for (int k = 1; k < 4; ++k) {
+                cv::Vec3d ref(
+                    std::max(0.0, classifier_colors[k][0] - black_ref[0]),
+                    std::max(0.0, classifier_colors[k][1] - black_ref[1]),
+                    std::max(0.0, classifier_colors[k][2] - black_ref[2]));
+                const double energy = ref[0] + ref[1] + ref[2];
+                min_color_energy = std::min(min_color_energy, energy);
+                if (energy > 1e-6) {
+                    ref /= energy;
+                }
+                ref_chroma[k] = ref;
+
+                int missing_channel = 0;
+                if (ref[1] < ref[missing_channel]) {
+                    missing_channel = 1;
+                }
+                if (ref[2] < ref[missing_channel]) {
+                    missing_channel = 2;
+                }
+                missing_channel_to_symbol[missing_channel] = k;
+            }
+            const double black_threshold = std::max(18.0, min_color_energy * 0.20);
 
             for (int row = 0; row < rows_local; ++row) {
                 for (int col = 0; col < cfg.cells_per_row; ++col) {
@@ -442,41 +1273,85 @@ bool sample_frame(const cv::Mat& frame, std::vector<uint8_t>& out_payload, Encod
                     const int cell_px_w = static_cast<int>(std::round(cw));
                     const int cell_px_h = static_cast<int>(std::round(ch));
                     if (x < 0 || y < 0 || x + cell_px_w > img_w || y + cell_px_h > img_h) {
-                        return std::vector<uint8_t>{};
+                        return std::vector<std::vector<uint8_t>>{};
                     }
 
-                    const int inset_x = std::max(1, cell_px_w / 4);
-                    const int inset_y = std::max(1, cell_px_h / 4);
+                    const int inset_x = std::max(1, cell_px_w / 3);
+                    const int inset_y = std::max(1, cell_px_h / 3);
                     const cv::Rect cell_rect(
                         x + inset_x,
                         y + inset_y,
                         std::max(1, cell_px_w - 2 * inset_x),
                         std::max(1, cell_px_h - 2 * inset_y));
-                    const cv::Scalar mean = cv::mean(aligned(cell_rect));
+                    const cv::Scalar mean = cv::mean(sample_source(cell_rect));
 
-                    int best = 0;
-                    int bestd = color_distance_sq(mean, classifier_colors[0]);
-                    for (int k = 1; k < 4; ++k) {
-                        const int d = color_distance_sq(mean, classifier_colors[k]);
-                        if (d < bestd) {
-                            best = k;
-                            bestd = d;
+                    cv::Vec3d cell(
+                        std::max(0.0, mean[0] - black_ref[0]),
+                        std::max(0.0, mean[1] - black_ref[1]),
+                        std::max(0.0, mean[2] - black_ref[2]));
+                    const double energy = cell[0] + cell[1] + cell[2];
+
+                    int chroma_symbol = 0;
+                    int missing_symbol = 0;
+                    if (energy <= black_threshold) {
+                        chroma_symbol = 0;
+                        missing_symbol = 0;
+                    } else {
+                        int missing_channel = 0;
+                        if (cell[1] < cell[missing_channel]) {
+                            missing_channel = 1;
+                        }
+                        if (cell[2] < cell[missing_channel]) {
+                            missing_channel = 2;
+                        }
+                        missing_symbol = missing_channel_to_symbol[missing_channel];
+                        if (missing_symbol < 1 || missing_symbol > 3) {
+                            missing_symbol = 0;
+                        }
+
+                        cell /= energy;
+                        double bestd = std::numeric_limits<double>::infinity();
+                        for (int k = 1; k < 4; ++k) {
+                            const cv::Vec3d diff = cell - ref_chroma[k];
+                            const double d = diff.dot(diff);
+                            if (d < bestd) {
+                                chroma_symbol = k;
+                                bestd = d;
+                            }
                         }
                     }
-                    cells_local.push_back(best);
+                    cells_local_chroma.push_back(chroma_symbol);
+                    cells_local_missing.push_back(missing_symbol);
                 }
             }
 
-            std::vector<uint8_t> payload;
-            payload.reserve(cells_local.size() / 4);
-            for (size_t i = 0; i + 3 < cells_local.size(); i += 4) {
-                uint8_t byte = 0;
-                for (int j = 0; j < 4; ++j) {
-                    byte |= static_cast<uint8_t>((cells_local[i + j] & 0x3) << (6 - 2 * j));
+            std::vector<std::vector<uint8_t>> payloads;
+            payloads.reserve(8);
+            auto append_payloads = [&](const std::vector<int>& cells_local) {
+                for (int phase = 0; phase < 4; ++phase) {
+                    if (cells_local.size() <= static_cast<size_t>(phase)) {
+                        break;
+                    }
+                    std::vector<uint8_t> payload;
+                    payload.reserve((cells_local.size() - static_cast<size_t>(phase)) / 4);
+                    for (size_t i = static_cast<size_t>(phase); i + 3 < cells_local.size(); i += 4) {
+                        uint8_t byte = 0;
+                        for (int j = 0; j < 4; ++j) {
+                            byte |= static_cast<uint8_t>((cells_local[i + j] & 0x3) << (6 - 2 * j));
+                        }
+                        payload.push_back(byte);
+                    }
+                    if (!payload.empty()) {
+                        payloads.push_back(std::move(payload));
+                    }
                 }
-                payload.push_back(byte);
+            };
+
+            append_payloads(cells_local_chroma);
+            if (cells_local_missing != cells_local_chroma) {
+                append_payloads(cells_local_missing);
             }
-            return payload;
+            return payloads;
         };
 
         auto header_distance = [](const std::vector<uint8_t>& payload) {
@@ -505,27 +1380,55 @@ bool sample_frame(const cv::Mat& frame, std::vector<uint8_t>& out_payload, Encod
         };
 
         std::vector<GridVariant> variants = {{0.0, 0.0, 1.0, 1.0, 0}};
-        if (std::string(label) == "warped") {
+        if (marker_layout) {
+            variants = {
+                {0.0, 0.0, 1.0, 1.0, 0},
+                {-0.05, 0.0, 1.0, 1.0, 0}, {0.05, 0.0, 1.0, 1.0, 0},
+                {0.0, -0.05, 1.0, 1.0, 0}, {0.0, 0.05, 1.0, 1.0, 0},
+                {0.0, 0.0, 0.995, 0.995, 0}, {0.0, 0.0, 1.005, 1.005, 0},
+                {0.0, 0.0, 1.0, 1.0, -1}, {0.0, 0.0, 1.0, 1.0, 1},
+            };
+        } else if (mode == "warped") {
             variants = {
                 {0.0, 0.0, 1.0, 1.0, 0},
                 {-0.15, 0.0, 1.0, 1.0, 0}, {0.15, 0.0, 1.0, 1.0, 0},
                 {0.0, -0.15, 1.0, 1.0, 0}, {0.0, 0.15, 1.0, 1.0, 0},
                 {-0.10, -0.10, 1.0, 1.0, 0}, {0.10, 0.10, 1.0, 1.0, 0},
                 {0.0, 0.0, 0.985, 0.985, 0}, {0.0, 0.0, 1.015, 1.015, 0},
-                {0.0, 0.0, 1.0, 1.0, -1}, {0.0, 0.0, 1.0, 1.0, 1},
-                {0.0, 0.0, 0.985, 0.985, -1}, {0.0, 0.0, 1.015, 1.015, 1},
+                {0.0, 0.0, 0.97, 0.97, 0}, {0.0, 0.0, 1.03, 1.03, 0},
+                {0.0, 0.0, 1.0, 0.97, 0}, {0.0, 0.0, 1.0, 1.03, 0},
+                {0.0, 0.0, 1.0, 1.0, -2}, {0.0, 0.0, 1.0, 1.0, -1},
+                {0.0, 0.0, 1.0, 1.0, 1}, {0.0, 0.0, 1.0, 1.0, 2},
+                {0.0, 0.0, 0.985, 0.985, -2}, {0.0, 0.0, 0.985, 0.985, -1},
+                {0.0, 0.0, 0.985, 0.985, 1}, {0.0, 0.0, 0.985, 0.985, 2},
+                {0.0, 0.0, 0.97, 0.97, -2}, {0.0, 0.0, 0.97, 0.97, -1},
+                {0.0, 0.0, 0.97, 0.97, 1}, {0.0, 0.0, 0.97, 0.97, 2},
             };
-        } else if (std::string(label) == "cropped") {
+        } else if (mode == "aligned") {
+            variants = {
+                {0.0, 0.0, 1.0, 1.0, 0},
+                {-0.08, 0.0, 1.0, 1.0, 0}, {0.08, 0.0, 1.0, 1.0, 0},
+                {0.0, -0.08, 1.0, 1.0, 0}, {0.0, 0.08, 1.0, 1.0, 0},
+                {0.0, 0.0, 0.99, 0.99, 0}, {0.0, 0.0, 1.01, 1.01, 0},
+                {0.0, 0.0, 0.985, 0.985, 0}, {0.0, 0.0, 1.015, 1.015, 0},
+                {0.0, 0.0, 1.0, 1.0, -1}, {0.0, 0.0, 1.0, 1.0, 1},
+                {0.0, 0.0, 0.99, 0.99, -1}, {0.0, 0.0, 0.99, 0.99, 1},
+                {0.0, 0.0, 1.01, 1.01, -1}, {0.0, 0.0, 1.01, 1.01, 1},
+            };
+        } else if (mode == "cropped") {
             variants = {
                 {0.0, 0.0, 1.0, 1.0, 0},
                 {-0.15, 0.0, 1.0, 1.0, 0}, {0.15, 0.0, 1.0, 1.0, 0},
                 {0.0, -0.15, 1.0, 1.0, 0}, {0.0, 0.15, 1.0, 1.0, 0},
                 {0.0, 0.0, 0.985, 0.985, 0}, {0.0, 0.0, 1.015, 1.015, 0},
-                {0.0, 0.0, 1.0, 1.0, -1}, {0.0, 0.0, 1.0, 1.0, 1},
+                {0.0, 0.0, 0.97, 0.97, 0}, {0.0, 0.0, 1.03, 1.03, 0},
+                {0.0, 0.0, 1.0, 1.0, -2}, {0.0, 0.0, 1.0, 1.0, -1},
+                {0.0, 0.0, 1.0, 1.0, 1}, {0.0, 0.0, 1.0, 1.0, 2},
             };
         }
 
         int best_score = std::numeric_limits<int>::max();
+        bool best_crc_match = false;
         std::vector<uint8_t> best_payload;
         for (const auto& variant : variants) {
             const int trial_rows = rows + variant.row_delta;
@@ -533,23 +1436,69 @@ bool sample_frame(const cv::Mat& frame, std::vector<uint8_t>& out_payload, Encod
                 continue;
             }
 
-            std::vector<uint8_t> payload = build_payload(
+            std::vector<std::vector<uint8_t>> payload_candidates = build_payload_candidates(
                 origin_x + variant.dx * cell_w,
                 origin_y + variant.dy * cell_h,
                 cell_w * variant.sx,
                 cell_h * variant.sy,
                 trial_rows);
-            if (payload.empty()) {
+            if (payload_candidates.empty()) {
                 continue;
             }
 
-            const int score = header_distance(payload);
-            if (score < best_score) {
-                best_score = score;
-                best_payload = std::move(payload);
-                if (score == 0) {
-                    break;
+            for (auto& payload : payload_candidates) {
+                const int score = header_distance(payload);
+                bool crc_match = false;
+                if (payload.size() >= 21 &&
+                    payload[0] == 0x43 &&
+                    payload[1] == 0x4D &&
+                    payload[2] == 0x41 &&
+                    payload[3] == 0x43 &&
+                    payload[4] == 0x01) {
+                    const uint32_t frame_index =
+                        static_cast<uint32_t>(payload[5]) |
+                        (static_cast<uint32_t>(payload[6]) << 8) |
+                        (static_cast<uint32_t>(payload[7]) << 16) |
+                        (static_cast<uint32_t>(payload[8]) << 24);
+                    const uint32_t total_frames =
+                        static_cast<uint32_t>(payload[9]) |
+                        (static_cast<uint32_t>(payload[10]) << 8) |
+                        (static_cast<uint32_t>(payload[11]) << 16) |
+                        (static_cast<uint32_t>(payload[12]) << 24);
+                    const uint32_t payload_bytes =
+                        static_cast<uint32_t>(payload[13]) |
+                        (static_cast<uint32_t>(payload[14]) << 8) |
+                        (static_cast<uint32_t>(payload[15]) << 16) |
+                        (static_cast<uint32_t>(payload[16]) << 24);
+                    const uint32_t checksum =
+                        static_cast<uint32_t>(payload[17]) |
+                        (static_cast<uint32_t>(payload[18]) << 8) |
+                        (static_cast<uint32_t>(payload[19]) << 16) |
+                        (static_cast<uint32_t>(payload[20]) << 24);
+
+                    if (total_frames > 0 &&
+                        frame_index < total_frames &&
+                        payload_bytes > 0 &&
+                        payload_bytes <= static_cast<uint32_t>(cfg.payload_bytes_per_frame) &&
+                        21u + payload_bytes <= payload.size()) {
+                        crc_match = crc32(payload.data() + 21, payload_bytes) == checksum;
+                    }
                 }
+
+                if ((crc_match && !best_crc_match) ||
+                    (crc_match == best_crc_match &&
+                     (score < best_score ||
+                      (score == best_score && payload.size() > best_payload.size())))) {
+                    best_crc_match = crc_match;
+                    best_score = score;
+                    best_payload = std::move(payload);
+                    if (crc_match) {
+                        break;
+                    }
+                }
+            }
+            if (best_crc_match) {
+                break;
             }
         }
 
@@ -561,28 +1510,30 @@ bool sample_frame(const cv::Mat& frame, std::vector<uint8_t>& out_payload, Encod
         return true;
     };
 
-    if (!exact_raw_layout) {
-        cv::Mat warped_first;
-        if (warp_with_finders(frame, warped_first) && sample_aligned(warped_first, "warped")) {
-            return true;
-        }
-
-        cv::Mat cropped_first = center_crop_square(frame);
-        if (sample_aligned(cropped_first, "cropped")) {
-            return true;
-        }
-    }
-
     if (exact_raw_layout && sample_aligned(frame, "raw")) {
         return true;
     }
 
-    cv::Mat warped;
-    if (warp_with_finders(frame, warped) && sample_aligned(warped, "warped")) {
+    cv::Mat finder_warped;
+    if (warp_with_structured_finders(frame, finder_warped, cfg) && sample_aligned(finder_warped, "aligned")) {
         return true;
     }
 
-    return sample_aligned(center_crop_square(frame), "cropped");
+    cv::Mat canvas_warped;
+    if (warp_with_canvas_quad(frame, canvas_warped, cfg) && sample_aligned(canvas_warped, "aligned")) {
+        return true;
+    }
+
+    cv::Mat cropped = center_crop_expected_layout(frame, cfg);
+    if (sample_aligned(cropped, "cropped")) {
+        return true;
+    }
+
+    cv::Mat warped;
+    if (warp_with_finders(frame, warped, cfg) && sample_aligned(warped, "warped")) {
+        return true;
+    }
+    return false;
 }
 
 double laplacian_variance(const cv::Mat& img) {

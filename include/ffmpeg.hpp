@@ -1,4 +1,4 @@
-// FFmpeg executable lookup and external process invocation interfaces.
+// 声明 FFmpeg 可执行文件查找与外部进程调用辅助接口。
 #pragma once
 
 #include <string>

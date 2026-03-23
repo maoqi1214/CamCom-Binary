@@ -1,4 +1,4 @@
-// FFmpeg executable discovery and command invocation helpers.
+// 实现 FFmpeg 可执行文件查找与外部进程调用辅助逻辑。
 #include "ffmpeg.hpp"
 
 #include <cstdlib>

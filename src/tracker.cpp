@@ -1,5 +1,4 @@
-// Kalman-based tracking and prediction for four corner points.
-
+// 实现对四个检测角点的 Kalman 跟踪与预测逻辑。
 #include "tracker.hpp"
 
 namespace camcom {
@@ -49,6 +48,16 @@ void QuadTracker::init(const std::array<cv::Point2f, 4>& pts) {
         last_[i] = pts[i];
     }
     initialized_ = true;
+}
+
+std::array<cv::Point2f, 4> QuadTracker::predict() {
+    if (!initialized_) {
+        return last_;
+    }
+    for (int i = 0; i < 4; ++i) {
+        last_[i] = corners_[i].predict();
+    }
+    return last_;
 }
 
 void QuadTracker::update(const std::array<cv::Point2f, 4>& meas) {

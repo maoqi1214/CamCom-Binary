@@ -1,231 +1,158 @@
 # CamCom-Binary
 
-这是一个把二进制文件编码成视频、再从视频里还原二进制文件的 C++ 项目。
+`CamCom-Binary` 是一个基于 C++、OpenCV 和 FFmpeg 的可见光传输实验项目。它将二进制文件编码为一系列彩色码帧并生成视频，再从屏幕录制或手机拍摄的视频中恢复出原始二进制数据。
 
-项目当前包含两个程序：
+项目当前提供两个命令行程序：
 
-- `encoder.exe`：把 `input.bin` 编码成 `output.mp4`
-- `decoder.exe`：把 `input.mp4` 解码回 `output.bin`
+- `encode`：将二进制文件编码为视频
+- `decode`：从视频中解码出二进制文件
 
-项目依赖：
+## 特性
 
-- `OpenCV`：图像处理
-- `ffmpeg.exe`：视频封装和抽帧
-- `CMake + Visual Studio 2026`：本地构建
+- 保留彩色编码，每个单元格承载 2 bit 信息
+- 固定 `15 FPS` 输出
+- 使用四角定位点进行检测和透视矫正
+- 支持原始生成视频回解，也支持手机录制视频解码
+- 解码端包含分组采样、QuadTracker 跟踪和多候选恢复逻辑
 
-## 1. 需要先准备什么
+## 依赖
 
-在本地运行前，需要先装好下面 4 个东西：
+- CMake 3.16 及以上
+- 支持 C++17 的编译器
+- OpenCV
+- FFmpeg
+- Windows 下推荐使用 Visual Studio 2026 或 Visual Studio 2022
 
-### 1. Visual Studio 2026
+## 构建
 
-安装时勾选：
+### Visual Studio 2026
 
-- `Desktop development with C++`
-
-### 2. CMake
-
-安装完成后，在命令行里确认：
-
-```bat
-cmake --version
+```powershell
+Set-Location C:\path\to\CamCom-Binary
+cmake -S . -B build-vs26 -G "Visual Studio 18 2026" -A x64 -DOpenCV_DIR="C:\path\to\opencv\build\x64\vc16\lib"
+cmake --build build-vs26 --config Release
 ```
 
-### 3. OpenCV
+### Visual Studio 2022
 
-你最终需要拿到一个包含 `OpenCVConfig.cmake` 的目录。
+```powershell
+Set-Location C:\path\to\CamCom-Binary
+cmake -S . -B build-vs22 -G "Visual Studio 17 2022" -A x64 -DOpenCV_DIR="C:\path\to\opencv\build\x64\vc16\lib"
+cmake --build build-vs22 --config Release
+```
 
-常见路径示例：
+构建完成后可执行文件默认位于：
 
 ```text
-opencv\build\x64\vc16\lib
+build-vs26\bin\Release\encode.exe
+build-vs26\bin\Release\decode.exe
 ```
 
-注意：
-
-- 传给 `build_vs26.bat` 的不是 OpenCV 根目录
-- 传的是 `OpenCVConfig.cmake` 所在目录
-- 也就是上面这个 `...\lib` 目录
-
-### 4. FFmpeg
-
-这一项最容易配错，所以这里写清楚。
-
-你们要下载的是：
-
-- Windows 版 FFmpeg
-- 下载后解压
-- 最后要能看到 `ffmpeg.exe`
-
-解压后通常会长这样：
+或：
 
 ```text
-....ffmpeg\bin\ffmpeg.exe
-或者 ....ffmpeg-master-latest-win64-gpl-shared\bin\ffmpeg.exe
+build-vs22\bin\Release\encode.exe
+build-vs22\bin\Release\decode.exe
 ```
 
-这里真正要加到系统变量 `Path` 的，不是 `ffmpeg.exe` 文件本身，而是它所在的目录：
+## 用法
+
+### encode
 
 ```text
-....ffmpeg\bin
-或者....ffmpeg-master-latest-win64-gpl-shared\bin
+encode <input.bin> <output.mp4> <max_milliseconds>
 ```
 
-也就是说，你应该这样做：
+示例：
 
-1. 下载 FFmpeg 的 Windows 压缩包
-2. 解压到一个固定目录，例如 `D:\tools\ffmpeg`
-3. 确认 `ffmpeg.exe` 在 `D:\tools\ffmpeg\bin\ffmpeg.exe`
-4. 把 `D:\tools\ffmpeg\bin` 加进系统环境变量 `Path`
-5. 重新打开终端
-6. 执行下面两条命令检查是否成功：
-
-```bat
-where ffmpeg
-ffmpeg -version
+```powershell
+.\build-vs26\bin\Release\encode.exe .\input.bin .\output.mp4 15000
 ```
 
-如果能输出路径和版本号，就说明 FFmpeg 已经配好了。
+说明：
 
-## 2. 项目怎么编译
+- 第一个参数：输入二进制文件
+- 第二个参数：输出视频路径
+- 第三个参数：允许生成视频的最大时长，单位毫秒
+- 当前编码器固定输出 `15 FPS`
 
-先克隆仓库：
+### decode
 
-```bat
-git clone https://github.com/maoqi1214/CamCom-Binary.git
-cd CamCom-Binary
-```
-
-然后在仓库根目录执行：
-
-```bat
-build_vs26.bat ......\opencv\build\x64\vc16\lib（前面省略号填写你的实际路径）
-```
-
-这里的参数要换成你自己机器上 `OpenCVConfig.cmake` 所在的目录（即bin目录）。
-
-## 3. 编译完成后程序在哪
-
-编译成功后，这两个程序在这里：
+三参数模式：
 
 ```text
-build-vs26\bin\Debug\encoder.exe
-build-vs26\bin\Debug\decoder.exe
+decode <input.mp4> <output.bin> <validity.bin>
 ```
 
-## 4. 怎么运行
-
-### 编码（在终端运行，以下input.bin,output.mp4,15是示例，实际使用时要替换,注意文件后缀）
-
-```bat
-build-vs26\bin\Debug\encoder.exe input.bin output.mp4 15
-```
-
-### 解码
-
-```bat
-build-vs26\bin\Debug\decoder.exe input.mp4 recovered.bin
-```
-
-### 可选：和原文件做对比（即decoder有两种编译方式，一个是传两个参数，一个是传三个参数）
-
-```bat
-build-vs26\bin\Debug\decoder.exe input.mp4 recovered.bin input.bin
-```
-（传三个参数时会多输出一个对比文件v1.bin，用于老师的测评代码）
-## 5. 手机录像时的注意事项
-
-如果你是先播放视频，再用手机录屏幕，建议注意：
-
-- 屏幕内容要拍全
-- 尽量避免反光
-- 尽量避免自动曝光剧烈变化
-- 视频最后多停 1 到 2 秒再结束录制
-- 不要让播放器控制条挡住最后几帧
-
-## 6. 最关键的两个路径
-
-### OpenCV 路径
-
-构建脚本参数传这个目录：
+四参数模式：
 
 ```text
-D:\vscode\light\opencv\build\x64\vc16\lib
+decode <input.mp4> <output.bin> <validity.bin> <reference.bin>
 ```
 
-### FFmpeg 路径
+示例：
 
-系统变量 `Path` 里加这个目录：
+```powershell
+.\build-vs26\bin\Release\decode.exe .\input.mp4 .\output.bin .\validity.bin
+.\build-vs26\bin\Release\decode.exe .\input.mp4 .\output.bin .\validity.bin .\input.bin
+```
+
+说明：
+
+- 三参数模式下，`validity.bin` 表示逐字节恢复有效性
+- 四参数模式下，`validity.bin` 表示与参考文件逐字节比较后的正确性掩码
+
+## 编码方式概述
+
+编码器会生成以下几类帧：
+
+- `bootstrap`：编码参数信息
+- `stream header`：总字节数、总帧数等流信息
+- 数据帧：实际二进制载荷
+- 重复帧：用于提升尾部恢复稳定性
+
+每个字节会拆成 4 个 2-bit 符号，并映射到彩色单元格中。当前实现保留彩色编码，不是黑白二维码方案。
+
+## 默认参数
+
+当前代码中的默认参数为：
+
+- 输出帧率：`15 FPS`
+- `cell_size`：`16`
+- 每行单元数：`137`
+- 每列单元数：`71`
+- 每帧数据字节数：`2400`
+- 理论有效传输速率：`2400 x 15 = 36000 byte/s`，约为 `36 KB/s`，即 `288 kbps`
+
+其中每帧数据字节数的来源如下：
+
+- 当前数据区共有 `137 x 71 = 9727` 个单元格
+- 每个单元格表示 `2 bit`
+- `4` 个单元格组成 `1 byte`
+- 因此整帧最多约可表示 `floor(9727 / 4) = 2431` 字节
+- 数据帧头固定占用 `4 + 1 + 4 + 4 + 4 + 4 = 21` 字节
+- 所以理论上的有效载荷上限约为 `2431 - 21 = 2410` 字节
+- 当前代码将其设置为 `2400` 字节，保留少量余量以提高布局和解码稳定性
+
+## 项目结构
 
 ```text
-D:\tools\ffmpeg\bin
+CamCom-Binary/
+├─ include/
+├─ src/
+├─ CMakeLists.txt
+└─ README.md
 ```
 
+主要源码文件：
 
-## 7. 配置完成后自检
+- `src/encoder.cpp`：编码器入口
+- `src/decoder.cpp`：解码器入口
+- `src/codec.cpp`：渲染、定位、矫正、采样
+- `src/tracker.cpp`：跟踪与 Kalman 相关逻辑
 
-配完环境后，可以先检查这三条命令：
+## 使用建议
 
-```bat
-cmake --version
-where ffmpeg
-ffmpeg -version
-```
-
-如果这三条都正常，再开始执行项目构建。
-
-## 8. 如果你用的是 VS2022
-
-如果你本机安装的是 Visual Studio 2022，那么 `build_vs26.bat` 里的生成器不能直接用。
-
-默认脚本现在写的是：
-
-```bat
-Visual Studio 18 2026
-```
-
-VS2022 对应的生成器是：
-
-```bat
-Visual Studio 17 2022
-```
-
-你有两种做法：
-
-### 做法 1：直接改 `build_vs26.bat`
-
-把脚本里这一行：
-
-```bat
-cmake -S . -B build-vs26 -G "Visual Studio 18 2026" -A x64 -DOpenCV_DIR="%OPENCV_DIR%"
-```
-
-改成：
-
-```bat
-cmake -S . -B build-vs26 -G "Visual Studio 17 2022" -A x64 -DOpenCV_DIR="%OPENCV_DIR%"
-```
-
-然后再执行：
-
-```bat
-build_vs26.bat 你的 OpenCVConfig.cmake 所在目录
-```
-
-### 做法 2：不改脚本，直接在终端执行
-
-在仓库根目录执行：
-
-```bat
-cmake -S . -B build-vs22 -G "Visual Studio 17 2022" -A x64 -DOpenCV_DIR="你的 OpenCV lib 目录"
-cmake --build build-vs22 --config Debug
-```
-
-编译成功后，可执行文件在：
-
-```text
-build-vs22\bin\Debug\encoder.exe
-build-vs22\bin\Debug\decoder.exe
-```
-
-如果是 VS2022，优先推荐做法 2，不会影响别人已经在用的 `build_vs26.bat`。
+- 先对原始生成视频做一次直接回解，确认编解码链路本身正常
+- 再进行全屏播放和手机录制测试
+- 拍摄时尽量保证码面完整入镜，避免强反光和曝光剧烈变化

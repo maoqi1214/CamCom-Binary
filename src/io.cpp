@@ -1,4 +1,4 @@
-// Binary file I/O and basic file state helpers.
+// 实现工具程序所需的二进制文件读写与基础文件状态辅助逻辑。
 #include "io.hpp"
 
 #include <fstream>

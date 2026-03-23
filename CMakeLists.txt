@@ -11,7 +11,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 if(MSVC)
-  add_compile_options(/W4)
+  add_compile_options(/W4 /utf-8)
 else()
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
@@ -23,7 +23,6 @@ add_library(camcom_core
   src/common.cpp
   src/ffmpeg.cpp
   src/io.cpp
-  src/rs.cpp
   src/tracker.cpp
 )
 
@@ -38,12 +37,12 @@ target_link_libraries(camcom_core
     ${OpenCV_LIBS}
 )
 
-add_executable(encoder src/encoder.cpp)
-target_link_libraries(encoder PRIVATE camcom_core)
+add_executable(encode src/encoder.cpp)
+target_link_libraries(encode PRIVATE camcom_core)
 
-add_executable(decoder src/decoder.cpp)
-target_link_libraries(decoder PRIVATE camcom_core)
+add_executable(decode src/decoder.cpp)
+target_link_libraries(decode PRIVATE camcom_core)
 
-set_target_properties(encoder decoder PROPERTIES
+set_target_properties(encode decode PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )

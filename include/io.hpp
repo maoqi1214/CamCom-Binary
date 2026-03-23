@@ -1,4 +1,4 @@
-// Binary file I/O and basic file utility interfaces.
+// 声明二进制文件读写与基础文件系统辅助接口。
 #pragma once
 
 #include <cstdint>

@@ -1,4 +1,4 @@
-// Kalman tracker interfaces for smoothing four corner points.
+// 声明用于平滑和预测四角位置的 Kalman 跟踪器接口。
 #pragma once
 
 #include <opencv2/opencv.hpp>
@@ -22,6 +22,7 @@ class QuadTracker {
 public:
     QuadTracker();
     void init(const std::array<cv::Point2f,4>& pts);
+    std::array<cv::Point2f,4> predict();
     void update(const std::array<cv::Point2f,4>& meas);
     std::array<cv::Point2f,4> get() const;
     bool is_initialized() const { return initialized_; }

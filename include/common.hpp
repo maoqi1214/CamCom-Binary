@@ -1,4 +1,4 @@
-// Shared constants, enums, and data structures for the encoder and decoder.
+// 定义编码端与解码端共用的常量、枚举、头结构和基础数据结构。
 #pragma once
 
 #include <cstddef>
@@ -8,7 +8,7 @@ namespace camcom {
 
 constexpr uint32_t MAGIC = 0x43414D43; // "CAMC"
 constexpr uint8_t FORMAT_VERSION = 1;
-constexpr int DEFAULT_FPS = 30;
+constexpr int DEFAULT_FPS = 15;
 constexpr int DEFAULT_CELL_SIZE = 20;
 constexpr int FINDER_MARKER_CELLS = 7;
 
@@ -22,7 +22,6 @@ enum class ExitCode : int {
 
 enum class Encoding : uint8_t {
     Binary = 0,
-    Gray4 = 1,
 };
 
 uint32_t crc32(const uint8_t* data, std::size_t length);
@@ -43,7 +42,6 @@ struct StreamHeader {
     Encoding encoding = Encoding::Binary;
     uint32_t fps = 0;
     uint32_t cell_size = 0;
-    uint32_t rs_nsym = 0;
     uint32_t payload_bytes_per_frame = 0;
     uint32_t cells_per_row = 0;
     uint32_t total_frames = 0;

@@ -1,6 +1,7 @@
 # Build outputs
 /build/
 /build-vs26/
+/build-codex/
 /out/
 *.o
 *.obj
@@ -40,6 +41,9 @@ Thumbs.db
 *.mkv
 *.mov
 
+# Local documentation and notes
+/docs/
+
 # Output data
 /output/
 output/*.bin
@@ -49,6 +53,7 @@ output/*.bin
 /temp_frames/
 /temp_frames_dec/
 frame_*.png
+/probe_frames/
 
 # Local generated data files
 /out.bin
@@ -60,6 +65,11 @@ frame_*.png
 /v1.bin
 /validity_mask.bin
 
+# Local Visual Studio / CMake settings
+/CMakeSettings.json
+
 # Visual Studio local cache
 /.vs/
 .github/copilot-instructions.md
+.github/copilot-instructions.md
+build_vs26.bat
