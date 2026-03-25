@@ -1,6 +1,7 @@
 // 实现 decode 主程序，包括帧解析、恢复与二进制重组逻辑。
 #include "codec.hpp"
 #include "common.hpp"
+#include "fec.hpp"
 #include "io.hpp"
 #include "tracker.hpp"
 
@@ -14,6 +15,7 @@
 #include <opencv2/core/utils/logger.hpp>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace camcom;
@@ -40,6 +42,22 @@ void print_progress_bar(size_t current, size_t total) {
     std::cout << "] "
         << std::setw(6) << std::fixed << std::setprecision(2) << percent << "% ("
         << clamped_current << "/" << total << ")" << std::flush;
+}
+
+void print_recovery_progress_bar(size_t current, size_t total) {
+    constexpr size_t kBarWidth = 32;
+    const size_t safe_total = std::max<size_t>(total, 1);
+    const size_t clamped_current = std::min(current, safe_total);
+    const size_t filled = (clamped_current * kBarWidth) / safe_total;
+    const double percent = 100.0 * static_cast<double>(clamped_current) / static_cast<double>(safe_total);
+
+    std::cout << "\rRecovering missing frames [";
+    for (size_t i = 0; i < kBarWidth; ++i) {
+        std::cout << (i < filled ? '#' : '-');
+    }
+    std::cout << "] "
+              << std::setw(6) << std::fixed << std::setprecision(2) << percent << "% ("
+              << clamped_current << "/" << total << ")" << std::flush;
 }
 
 std::vector<uint8_t> majority_vote_samples(
@@ -135,6 +153,11 @@ uint64_t read_u64_le(const uint8_t* p) {
     return value;
 }
 
+size_t max_source_payload_bytes_per_frame(const EncoderConfig& cfg) {
+    return fec_max_source_size_for_encoded_capacity(
+        static_cast<size_t>(cfg.payload_bytes_per_frame));
+}
+
 int header_hamming_distance_at(const std::vector<uint8_t>& sample, size_t off) {
     constexpr uint8_t target[5] = {0x43, 0x4D, 0x41, 0x43, 0x01};
     if (off + 5 > sample.size()) {
@@ -205,7 +228,7 @@ bool try_parse_bootstrap(const std::vector<uint8_t>& sample, EncoderConfig& cfg)
         const bool sane =
             cell_size >= 8 && cell_size <= 64 &&
             cells_per_row >= 16 && cells_per_row <= 256 &&
-            payload_per >= 64 && payload_per <= 4096 &&
+            payload_per >= 64 && payload_per <= 16384 &&
             fps >= 1 && fps <= 60 &&
             reference_block_size >= 1 && reference_block_size <= 8;
         if (!sane) {
@@ -251,7 +274,7 @@ bool try_parse_stream_header(
 
         const bool sane =
             cell_size >= 8 && cell_size <= 64 &&
-            payload_per >= 64 && payload_per <= 4096 &&
+            payload_per >= 64 && payload_per <= 16384 &&
             cells_per_row >= 16 && cells_per_row <= 256 &&
             total_frames_hdr >= 1 && total_frames_hdr <= 100000 &&
             fps >= 1 && fps <= 60 &&
@@ -282,72 +305,44 @@ bool try_parse_data_frame(
         return false;
     }
 
-    const size_t full_codeword_len = kFrameHeaderBytes + static_cast<size_t>(cfg.payload_bytes_per_frame);
-    if (cfg.payload_bytes_per_frame > 0 && sample.size() >= full_codeword_len) {
-        for (size_t off = 0; off + full_codeword_len <= sample.size(); ++off) {
-            const uint8_t* p = sample.data() + static_cast<std::ptrdiff_t>(off);
-            FrameHeader local{};
-            local.magic = read_u32_le(p); p += 4;
-            local.version = *p; p += 1;
-            local.frame_index = read_u32_le(p); p += 4;
-            local.total_frames = read_u32_le(p); p += 4;
-            local.payload_bytes = read_u32_le(p); p += 4;
-            local.checksum = read_u32_le(p); p += 4;
-
-            if (local.magic != MAGIC || local.version != FORMAT_VERSION) {
-                continue;
-            }
-            if (local.total_frames == 0 || local.frame_index >= local.total_frames) {
-                continue;
-            }
-            if (local.payload_bytes == 0 || local.payload_bytes > static_cast<uint32_t>(cfg.payload_bytes_per_frame)) {
-                continue;
-            }
-
-            const size_t payload_len = static_cast<size_t>(local.payload_bytes);
-            if (off + kFrameHeaderBytes + payload_len > sample.size()) {
-                continue;
-            }
-            if (crc32(p, payload_len) != local.checksum) {
-                continue;
-            }
-
-            hdr = local;
-            payload_out.assign(p, p + payload_len);
-            return true;
-        }
-    }
-
+    const size_t source_payload_limit = max_source_payload_bytes_per_frame(cfg);
     for (size_t off = 0; off + kFrameHeaderBytes <= sample.size(); ++off) {
         const uint8_t* raw = sample.data() + static_cast<std::ptrdiff_t>(off);
-        if (read_u32_le(raw) != MAGIC || raw[4] != FORMAT_VERSION) {
+        FrameHeader local{};
+        local.magic = read_u32_le(raw);
+        local.version = raw[4];
+        if (local.magic != MAGIC || local.version != FORMAT_VERSION) {
             continue;
         }
 
-        const uint32_t payload_bytes = read_u32_le(raw + 13);
-        if (payload_bytes == 0 || payload_bytes > static_cast<uint32_t>(cfg.payload_bytes_per_frame)) {
+        local.frame_index = read_u32_le(raw + 5);
+        local.total_frames = read_u32_le(raw + 9);
+        local.payload_bytes = read_u32_le(raw + 13);
+        local.checksum = read_u32_le(raw + 17);
+
+        if (local.total_frames == 0 || local.frame_index >= local.total_frames) {
+            continue;
+        }
+        if (local.payload_bytes == 0 ||
+            local.payload_bytes > static_cast<uint32_t>(source_payload_limit)) {
             continue;
         }
 
-        const uint32_t frame_index = read_u32_le(raw + 5);
-        const uint32_t total_frames = read_u32_le(raw + 9);
-        const uint32_t checksum = read_u32_le(raw + 17);
-        if (total_frames == 0 || frame_index >= total_frames) {
-            continue;
-        }
-
+        const size_t source_payload_len = static_cast<size_t>(local.payload_bytes);
+        const size_t encoded_payload_len =
+            fec_encoded_size_for_source_size(source_payload_len);
         const size_t raw_payload_off = off + kFrameHeaderBytes;
-        const size_t raw_payload_end = raw_payload_off + static_cast<size_t>(payload_bytes);
+        const size_t raw_payload_end = raw_payload_off + encoded_payload_len;
         if (raw_payload_end <= sample.size()) {
-            const uint8_t* raw_payload = sample.data() + static_cast<std::ptrdiff_t>(raw_payload_off);
-            if (crc32(raw_payload, payload_bytes) == checksum) {
-                hdr.magic = MAGIC;
-                hdr.version = FORMAT_VERSION;
-                hdr.frame_index = frame_index;
-                hdr.total_frames = total_frames;
-                hdr.payload_bytes = payload_bytes;
-                hdr.checksum = checksum;
-                payload_out.assign(raw_payload, raw_payload + payload_bytes);
+            const std::vector<uint8_t> encoded_payload(
+                sample.begin() + static_cast<std::ptrdiff_t>(raw_payload_off),
+                sample.begin() + static_cast<std::ptrdiff_t>(raw_payload_end));
+            std::vector<uint8_t> decoded_payload;
+            if (fec_decode_payload(encoded_payload, source_payload_len, decoded_payload) &&
+                decoded_payload.size() == source_payload_len &&
+                crc32(decoded_payload.data(), decoded_payload.size()) == local.checksum) {
+                hdr = local;
+                payload_out = std::move(decoded_payload);
                 return true;
             }
         }
@@ -384,7 +379,7 @@ bool try_parse_raw_frame_header(
             continue;
         }
         if (local.payload_bytes == 0 ||
-            local.payload_bytes > static_cast<uint32_t>(cfg.payload_bytes_per_frame)) {
+            local.payload_bytes > static_cast<uint32_t>(max_source_payload_bytes_per_frame(cfg))) {
             continue;
         }
 
@@ -430,7 +425,7 @@ bool find_best_raw_header_candidate(
             local.total_frames <= 100000 &&
             local.frame_index < local.total_frames &&
             local.payload_bytes > 0 &&
-            local.payload_bytes <= static_cast<uint32_t>(cfg.payload_bytes_per_frame);
+            local.payload_bytes <= static_cast<uint32_t>(max_source_payload_bytes_per_frame(cfg));
         if (!sane) {
             continue;
         }
@@ -562,18 +557,19 @@ void recover_grouped_frames(
 
         if (!recovered && group.hdr.payload_bytes > 0) {
             const size_t payload_len = static_cast<size_t>(group.hdr.payload_bytes);
+            const size_t encoded_payload_len = fec_encoded_size_for_source_size(payload_len);
             std::vector<std::vector<uint8_t>> payload_samples;
             payload_samples.reserve(group.samples.size());
             std::vector<uint32_t> checksum_samples;
             checksum_samples.reserve(group.samples.size());
 
             for (const auto& sample : group.samples) {
-                if (sample.size() < 21 + payload_len) {
+                if (sample.size() < 21 + encoded_payload_len) {
                     continue;
                 }
                 payload_samples.emplace_back(
                     sample.begin() + 21,
-                    sample.begin() + 21 + static_cast<std::ptrdiff_t>(payload_len));
+                    sample.begin() + 21 + static_cast<std::ptrdiff_t>(encoded_payload_len));
                 checksum_samples.push_back(read_u32_le(sample.data() + 17));
             }
 
@@ -625,11 +621,14 @@ void recover_grouped_frames(
                 };
                 for (const uint32_t checksum : checksum_candidates) {
                     for (const auto& candidate_payload : payload_candidates) {
-                        if (candidate_payload.size() == payload_len &&
-                            crc32(candidate_payload.data(), candidate_payload.size()) == checksum) {
+                        std::vector<uint8_t> decoded_candidate;
+                        if (candidate_payload.size() == encoded_payload_len &&
+                            fec_decode_payload(candidate_payload, payload_len, decoded_candidate) &&
+                            decoded_candidate.size() == payload_len &&
+                            crc32(decoded_candidate.data(), decoded_candidate.size()) == checksum) {
                             hdr = group.hdr;
                             hdr.checksum = checksum;
-                            payload = candidate_payload;
+                            payload = std::move(decoded_candidate);
                             recovered = true;
                             break;
                         }
@@ -643,12 +642,15 @@ void recover_grouped_frames(
             if (!recovered &&
                 group.hdr.total_frames > 0 &&
                 group.hdr.frame_index + 1 == group.hdr.total_frames &&
-                payload_len < static_cast<size_t>(cfg.payload_bytes_per_frame) &&
+                payload_len < max_source_payload_bytes_per_frame(cfg) &&
                 payload_samples.size() >= 2) {
                 const std::vector<uint8_t> candidate_payload = plurality_vote_samples(payload_samples);
-                if (candidate_payload.size() == payload_len) {
+                std::vector<uint8_t> decoded_candidate;
+                if (candidate_payload.size() == encoded_payload_len &&
+                    fec_decode_payload(candidate_payload, payload_len, decoded_candidate) &&
+                    decoded_candidate.size() == payload_len) {
                     hdr = group.hdr;
-                    payload = candidate_payload;
+                    payload = std::move(decoded_candidate);
                     recovered = true;
                 }
             }
@@ -674,7 +676,7 @@ uint64_t infer_total_bytes_from_frames(
     }
 
     return static_cast<uint64_t>(expected_total_frames - 1) *
-        static_cast<uint64_t>(cfg.payload_bytes_per_frame) +
+        static_cast<uint64_t>(max_source_payload_bytes_per_frame(cfg)) +
         static_cast<uint64_t>(last_it->second.size());
 }
 
@@ -687,7 +689,9 @@ bool process_sample_candidate(
     uint32_t& expected_total_frames,
     uint64_t& expected_total_bytes,
     std::unordered_map<uint32_t, std::vector<uint8_t>>& frames_buffer,
-    std::unordered_map<uint32_t, RawFrameSampleGroup>& raw_frame_samples) {
+    std::unordered_map<uint32_t, RawFrameSampleGroup>& raw_frame_samples,
+    std::unordered_map<uint64_t, int>& frame_payload_votes,
+    std::unordered_map<uint32_t, uint32_t>& frame_best_payload_crc) {
     FrameHeader raw_hdr{};
     size_t header_offset = 0;
     int header_distance = 0;
@@ -741,9 +745,25 @@ bool process_sample_candidate(
             expected_total_frames = hdr.total_frames;
         }
 
-        auto [it, inserted] = frames_buffer.emplace(hdr.frame_index, std::move(payload));
-        if (!inserted && it->second.empty()) {
-            it->second = std::move(payload);
+        const uint32_t payload_crc = crc32(payload.data(), payload.size());
+        const uint64_t vote_key =
+            (static_cast<uint64_t>(hdr.frame_index) << 32) | payload_crc;
+        const int votes = ++frame_payload_votes[vote_key];
+
+        int best_votes = 0;
+        if (const auto best_it = frame_best_payload_crc.find(hdr.frame_index);
+            best_it != frame_best_payload_crc.end()) {
+            const uint64_t best_key =
+                (static_cast<uint64_t>(hdr.frame_index) << 32) | best_it->second;
+            if (const auto vote_it = frame_payload_votes.find(best_key);
+                vote_it != frame_payload_votes.end()) {
+                best_votes = vote_it->second;
+            }
+        }
+
+        if (votes >= best_votes) {
+            frame_best_payload_crc[hdr.frame_index] = payload_crc;
+            frames_buffer[hdr.frame_index] = std::move(payload);
         }
         matched = true;
     }
@@ -763,7 +783,9 @@ void process_frame(
     uint64_t& expected_total_bytes,
     std::unordered_map<uint32_t, std::vector<uint8_t>>& frames_buffer,
     std::unordered_map<int, std::deque<std::vector<uint8_t>>>& sample_histories,
-    std::unordered_map<uint32_t, RawFrameSampleGroup>& raw_frame_samples) {
+    std::unordered_map<uint32_t, RawFrameSampleGroup>& raw_frame_samples,
+    std::unordered_map<uint64_t, int>& frame_payload_votes,
+    std::unordered_map<uint32_t, uint32_t>& frame_best_payload_crc) {
     if (frame.empty() || is_black_frame(frame)) {
         return;
     }
@@ -809,7 +831,9 @@ void process_frame(
                     expected_total_frames,
                     expected_total_bytes,
                     frames_buffer,
-                    raw_frame_samples)) {
+                    raw_frame_samples,
+                    frame_payload_votes,
+                    frame_best_payload_crc)) {
                 return true;
             }
         }
@@ -831,7 +855,9 @@ void process_frame_group(
     uint64_t& expected_total_bytes,
     std::unordered_map<uint32_t, std::vector<uint8_t>>& frames_buffer,
     std::unordered_map<uint32_t, RawFrameSampleGroup>& raw_frame_samples,
-    TrackingDecodeState& tracking) {
+    TrackingDecodeState& tracking,
+    std::unordered_map<uint64_t, int>& frame_payload_votes,
+    std::unordered_map<uint32_t, uint32_t>& frame_best_payload_crc) {
     if (group_frames.empty()) {
         return;
     }
@@ -888,7 +914,9 @@ void process_frame_group(
                     expected_total_frames,
                     expected_total_bytes,
                     frames_buffer,
-                    raw_frame_samples)) {
+                    raw_frame_samples,
+                    frame_payload_votes,
+                    frame_best_payload_crc)) {
                 return true;
             }
             if (process_sample_candidate(
@@ -900,7 +928,9 @@ void process_frame_group(
                     expected_total_frames,
                     expected_total_bytes,
                     frames_buffer,
-                    raw_frame_samples)) {
+                    raw_frame_samples,
+                    frame_payload_votes,
+                    frame_best_payload_crc)) {
                 return true;
             }
         }
@@ -914,7 +944,9 @@ void process_frame_group(
                     expected_total_frames,
                     expected_total_bytes,
                     frames_buffer,
-                    raw_frame_samples)) {
+                    raw_frame_samples,
+                    frame_payload_votes,
+                    frame_best_payload_crc)) {
                 return true;
             }
         }
@@ -928,7 +960,9 @@ void process_frame_group(
                     expected_total_frames,
                     expected_total_bytes,
                     frames_buffer,
-                    raw_frame_samples)) {
+                    raw_frame_samples,
+                    frame_payload_votes,
+                    frame_best_payload_crc)) {
                 return true;
             }
         }
@@ -1009,6 +1043,8 @@ bool decode_frames_from_video(
     size_t last_reported_frames = static_cast<size_t>(-1);
     std::unordered_map<int, std::deque<std::vector<uint8_t>>> sample_histories;
     std::unordered_map<uint32_t, RawFrameSampleGroup> raw_frame_samples;
+    std::unordered_map<uint64_t, int> frame_payload_votes;
+    std::unordered_map<uint32_t, uint32_t> frame_best_payload_crc;
     TrackingDecodeState tracking;
     if (total_frames > 0) {
         std::cout << "Backend reported " << total_frames << " frame(s).\n";
@@ -1038,7 +1074,9 @@ bool decode_frames_from_video(
                     expected_total_bytes,
                     frames_buffer,
                     raw_frame_samples,
-                    tracking);
+                    tracking,
+                    frame_payload_votes,
+                    frame_best_payload_crc);
             }
             previous_signature = signature;
             screen_group_frames.push_back(frame.clone());
@@ -1052,7 +1090,9 @@ bool decode_frames_from_video(
                 expected_total_bytes,
                 frames_buffer,
                 sample_histories,
-                raw_frame_samples);
+                raw_frame_samples,
+                frame_payload_votes,
+                frame_best_payload_crc);
         }
 
         if (total_frames > 0 &&
@@ -1074,7 +1114,9 @@ bool decode_frames_from_video(
             expected_total_bytes,
             frames_buffer,
             raw_frame_samples,
-            tracking);
+            tracking,
+            frame_payload_votes,
+            frame_best_payload_crc);
     }
 
     if (total_frames > 0) {
@@ -1096,7 +1138,11 @@ bool decode_frames_from_video(
     std::cout << "multi-sample groups: " << multi_sample_group_count << "\n";
     std::cout << "max group samples : " << max_group_samples << "\n";
 
+    const size_t grouped_recovery_before = frames_buffer.size();
+    std::cout << "recovering grouped samples...\n";
     recover_grouped_frames(raw_frame_samples, cfg, frames_buffer);
+    std::cout << "recovered by grouped samples: "
+              << (frames_buffer.size() - grouped_recovery_before) << "\n";
     return true;
 }
 
@@ -1119,6 +1165,9 @@ void recover_missing_frames_from_video_windows(
     if (missing_indices.empty()) {
         return;
     }
+    std::cout << "recovering missing frames in local windows...\n";
+    std::cout << "missing before recovery: " << missing_indices.size()
+              << "/" << expected_total_frames << "\n";
 
     cv::VideoCapture cap(video_path, cv::CAP_ANY);
     if (!cap.isOpened()) {
@@ -1130,10 +1179,72 @@ void recover_missing_frames_from_video_windows(
     const int total_capture_frames = std::max(0, static_cast<int>(std::llround(cap.get(cv::CAP_PROP_FRAME_COUNT))));
     constexpr int kLeadInFrames = 6;
     constexpr int kWindowMarginFrames = 24;
+    constexpr size_t kGlobalScanMinMissing = 12;
 
     cv::Mat frame;
+    size_t recovered_count = 0;
+    size_t processed_missing = 0;
+    size_t last_reported = static_cast<size_t>(-1);
+
+    if (missing_indices.size() >= kGlobalScanMinMissing) {
+        std::cout << "large missing set detected, switching to full-video recovery scan...\n";
+        std::unordered_set<uint32_t> missing_set(missing_indices.begin(), missing_indices.end());
+        if (!cap.set(cv::CAP_PROP_POS_FRAMES, 0)) {
+            return;
+        }
+
+        size_t scanned_frames = 0;
+        size_t last_scan_reported = static_cast<size_t>(-1);
+        while (!missing_set.empty() && cap.read(frame)) {
+            if (frame.empty()) {
+                continue;
+            }
+            ++scanned_frames;
+
+            EncoderConfig candidate_cfg = cfg;
+            std::vector<uint8_t> sample;
+            if (!sample_frame(frame, sample, candidate_cfg)) {
+                continue;
+            }
+
+            FrameHeader hdr{};
+            std::vector<uint8_t> payload;
+            if (!try_parse_data_frame(sample, candidate_cfg, hdr, payload)) {
+                continue;
+            }
+
+            if (missing_set.erase(hdr.frame_index) > 0) {
+                frames_buffer[hdr.frame_index] = std::move(payload);
+                ++recovered_count;
+            }
+
+            if (total_capture_frames > 0 &&
+                (scanned_frames == static_cast<size_t>(total_capture_frames) ||
+                 scanned_frames == 1 ||
+                 scanned_frames - last_scan_reported >= 20)) {
+                print_recovery_progress_bar(scanned_frames, static_cast<size_t>(total_capture_frames));
+                last_scan_reported = scanned_frames;
+            }
+        }
+
+        if (total_capture_frames > 0) {
+            print_recovery_progress_bar(std::min(scanned_frames, static_cast<size_t>(total_capture_frames)),
+                                        static_cast<size_t>(total_capture_frames));
+            std::cout << "\n";
+        }
+        std::cout << "recovered by window scan: " << recovered_count << "\n";
+        return;
+    }
+
     for (const uint32_t missing_index : missing_indices) {
+        ++processed_missing;
         if (frames_buffer.find(missing_index) != frames_buffer.end()) {
+            if (processed_missing == missing_indices.size() ||
+                processed_missing == 1 ||
+                processed_missing - last_reported >= 10) {
+                print_recovery_progress_bar(processed_missing, missing_indices.size());
+                last_reported = processed_missing;
+            }
             continue;
         }
 
@@ -1170,10 +1281,21 @@ void recover_missing_frames_from_video_windows(
             }
             if (hdr.frame_index == missing_index) {
                 frames_buffer[missing_index] = std::move(payload);
+                ++recovered_count;
                 break;
             }
         }
+
+        if (processed_missing == missing_indices.size() ||
+            processed_missing == 1 ||
+            processed_missing - last_reported >= 10) {
+            print_recovery_progress_bar(processed_missing, missing_indices.size());
+            last_reported = processed_missing;
+        }
     }
+    print_recovery_progress_bar(processed_missing, missing_indices.size());
+    std::cout << "\n"
+              << "recovered by window scan: " << recovered_count << "\n";
 }
 
 } // namespace

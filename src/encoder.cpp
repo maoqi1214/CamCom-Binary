@@ -1,6 +1,7 @@
 // 实现 encode 主程序，将二进制输入编码为可视化帧并生成视频。
 #include "codec.hpp"
 #include "common.hpp"
+#include "fec.hpp"
 #include "ffmpeg.hpp"
 #include "io.hpp"
 
@@ -24,17 +25,18 @@ namespace fs = std::filesystem;
 
 namespace {
 
-constexpr int kFixedOutputFps = 15;
-constexpr int kBootstrapRepeat = 3;
-constexpr int kStreamHeaderRepeat = 3;
-constexpr int kLastFrameRepeat = 3;
-constexpr int kFinalHeaderRepeat = 3;
+constexpr int kFixedOutputFps = 20;
+constexpr int kBootstrapRepeat = 0;
+constexpr int kStreamHeaderRepeat = 0;
+constexpr int kLastFrameRepeat = 0;
+constexpr int kFinalHeaderRepeat = 0;
 constexpr int kFixedOverheadFrames = kBootstrapRepeat + kStreamHeaderRepeat + kFinalHeaderRepeat;
+constexpr size_t kFrameHeaderBytes = 4 + 1 + 4 + 4 + 4 + 4;
 
 void print_usage(const char* argv0) {
     std::cerr
-        << "Usage: " << argv0 << " <input.bin> <output.mp4> <max_milliseconds>\n"
-        << "Example: " << argv0 << " payload.bin out.mp4 2000\n";
+        << "Usage: " << argv0 << " <input.bin> <output.mp4> <duration_milliseconds>\n"
+        << "Example: " << argv0 << " payload.bin out.mp4 1000\n";
 }
 
 void init_console_utf8() {
@@ -89,6 +91,7 @@ std::vector<uint8_t> build_stream_header(const EncoderConfig& cfg, size_t total_
 std::vector<uint8_t> build_frame_codeword(
     uint32_t frame_index,
     uint32_t total_frames,
+    const EncoderConfig& cfg,
     const std::vector<uint8_t>& data,
     size_t offset,
     size_t chunk) {
@@ -101,9 +104,14 @@ std::vector<uint8_t> build_frame_codeword(
 
     const size_t checksum_pos = frame_buf.size();
     serialize_u32(frame_buf, 0);
-    frame_buf.insert(frame_buf.end(), data.begin() + offset, data.begin() + offset + chunk);
+    const std::vector<uint8_t> source_payload(
+        data.begin() + static_cast<std::ptrdiff_t>(offset),
+        data.begin() + static_cast<std::ptrdiff_t>(offset + chunk));
+    const std::vector<uint8_t> encoded_payload =
+        fec_encode_payload(source_payload, static_cast<size_t>(cfg.payload_bytes_per_frame));
+    frame_buf.insert(frame_buf.end(), encoded_payload.begin(), encoded_payload.end());
 
-    const uint32_t checksum = crc32(frame_buf.data() + checksum_pos + 4, chunk);
+    const uint32_t checksum = crc32(source_payload.data(), source_payload.size());
     frame_buf[checksum_pos + 0] = static_cast<uint8_t>(checksum & 0xFFu);
     frame_buf[checksum_pos + 1] = static_cast<uint8_t>((checksum >> 8) & 0xFFu);
     frame_buf[checksum_pos + 2] = static_cast<uint8_t>((checksum >> 16) & 0xFFu);
@@ -144,6 +152,43 @@ size_t calculate_total_output_frames(uint32_t data_frames) {
     return total;
 }
 
+size_t max_chunk_bytes_for_frame_budget(
+    const EncoderConfig& cfg,
+    size_t prefix_bytes,
+    size_t chunk_upper_bound) {
+    const size_t frame_byte_budget =
+        kFrameHeaderBytes + static_cast<size_t>(cfg.payload_bytes_per_frame);
+    if (prefix_bytes + kFrameHeaderBytes >= frame_byte_budget) {
+        return 0;
+    }
+
+    const size_t max_source_bytes =
+        fec_max_source_size_for_encoded_capacity(
+            static_cast<size_t>(cfg.payload_bytes_per_frame));
+    size_t hi = std::min(chunk_upper_bound, max_source_bytes);
+    if (hi == 0) {
+        return 0;
+    }
+
+    size_t lo = 1;
+    size_t best = 0;
+    while (lo <= hi) {
+        const size_t mid = lo + (hi - lo) / 2;
+        const size_t encoded_payload = fec_encoded_size_for_source_size(mid);
+        const size_t total_bytes = prefix_bytes + kFrameHeaderBytes + encoded_payload;
+        if (total_bytes <= frame_byte_budget) {
+            best = mid;
+            lo = mid + 1;
+        } else {
+            if (mid == 0) {
+                break;
+            }
+            hi = mid - 1;
+        }
+    }
+    return best;
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -157,7 +202,13 @@ int main(int argc, char* argv[]) {
 
     const std::string input_path = argv[1];
     const std::string output_path = argv[2];
-    const double max_milliseconds = std::stod(argv[3]);
+    double max_milliseconds = 0.0;
+    try {
+        max_milliseconds = std::stod(argv[3]);
+    } catch (const std::exception&) {
+        std::cerr << "Error: max_milliseconds must be a number.\n";
+        return static_cast<int>(ExitCode::BadArgs);
+    }
 
     if (!(max_milliseconds > 0.0)) {
         std::cerr << "Error: max_milliseconds must be > 0.\n";
@@ -171,27 +222,60 @@ int main(int argc, char* argv[]) {
     const auto data = read_binary_file(input_path);
 
     EncoderConfig cfg = make_default_encoder_config(kFixedOutputFps);
+    const FecConfig& fec_cfg = default_fec_config();
 
-    const size_t payload_per_frame = static_cast<size_t>(cfg.payload_bytes_per_frame);
-    const uint32_t total_frames = static_cast<uint32_t>((data.size() + payload_per_frame - 1) / payload_per_frame);
-    const size_t total_output_frames = calculate_total_output_frames(total_frames);
-    const double output_milliseconds =
-        1000.0 * static_cast<double>(total_output_frames) / static_cast<double>(kFixedOutputFps);
-    if (output_milliseconds > max_milliseconds) {
-        const size_t repeated_tail_frames = total_frames > 0 ? static_cast<size_t>(kLastFrameRepeat) : 0;
-        std::cerr << "Error: max_milliseconds is too small.\n"
-                  << "  limit           : " << std::fixed << std::setprecision(3)
-                  << max_milliseconds << " ms\n"
-                  << "  required minimum: " << output_milliseconds << " ms\n"
-                  << "  total frames    : " << total_output_frames << "\n"
-                  << "  data frames     : " << total_frames << "\n"
-                  << "  overhead frames : " << (kFixedOverheadFrames + repeated_tail_frames) << "\n"
-                  << "  fixed fps       : " << kFixedOutputFps << "\n";
+    const size_t payload_per_frame =
+        fec_max_source_size_for_encoded_capacity(
+            static_cast<size_t>(cfg.payload_bytes_per_frame),
+            fec_cfg);
+    const uint32_t full_data_frames =
+        static_cast<uint32_t>((data.size() + payload_per_frame - 1) / payload_per_frame);
+
+    const std::vector<uint8_t> bootstrap_buf = build_bootstrap(cfg);
+    const std::vector<uint8_t> stream_buf_template = build_stream_header(cfg, 0, 0);
+    const size_t first_frame_prefix_bytes = bootstrap_buf.size() + stream_buf_template.size();
+    const size_t target_output_frames = static_cast<size_t>(std::llround(
+        max_milliseconds * static_cast<double>(kFixedOutputFps) / 1000.0));
+    if (target_output_frames == 0) {
+        std::cerr << "Error: max_milliseconds is too small for fixed fps "
+                  << kFixedOutputFps << ".\n";
         return static_cast<int>(ExitCode::BadArgs);
     }
 
-    const int frame_header_bytes = 4 + 1 + 4 + 4 + 4 + 4;
-    const int max_codeword_bytes = frame_header_bytes + cfg.payload_bytes_per_frame;
+    const size_t min_frames_for_data =
+        static_cast<size_t>(kFixedOverheadFrames + kLastFrameRepeat + 1);
+    if (target_output_frames < min_frames_for_data) {
+        std::cerr << "Error: max_milliseconds is too small to carry payload data.\n"
+                  << "  target frames    : " << target_output_frames << "\n"
+                  << "  minimum required : " << min_frames_for_data << "\n"
+                  << "  fixed fps        : " << kFixedOutputFps << "\n";
+        return static_cast<int>(ExitCode::BadArgs);
+    }
+
+    const size_t max_data_frames_by_time =
+        target_output_frames - static_cast<size_t>(kFixedOverheadFrames + kLastFrameRepeat);
+    std::vector<size_t> frame_chunks;
+    frame_chunks.reserve(max_data_frames_by_time);
+    size_t encoded_total_bytes = 0;
+    for (size_t i = 0; i < max_data_frames_by_time && encoded_total_bytes < data.size(); ++i) {
+        const size_t prefix_bytes = (i == 0) ? first_frame_prefix_bytes : 0;
+        const size_t chunk_upper_bound = data.size() - encoded_total_bytes;
+        const size_t chunk = max_chunk_bytes_for_frame_budget(cfg, prefix_bytes, chunk_upper_bound);
+        if (chunk == 0) {
+            break;
+        }
+        frame_chunks.push_back(chunk);
+        encoded_total_bytes += chunk;
+    }
+
+    const uint32_t encoded_data_frames = static_cast<uint32_t>(frame_chunks.size());
+    if (encoded_data_frames == 0 || encoded_total_bytes == 0) {
+        std::cerr << "Error: no payload frame can be encoded under current max_milliseconds.\n";
+        return static_cast<int>(ExitCode::BadArgs);
+    }
+    const size_t encoded_total_output_frames = calculate_total_output_frames(encoded_data_frames);
+
+    const int max_codeword_bytes = static_cast<int>(kFrameHeaderBytes) + cfg.payload_bytes_per_frame;
     const int max_cells = max_codeword_bytes * 4;
     const int max_rows = static_cast<int>((max_cells + cfg.cells_per_row - 1) / cfg.cells_per_row);
     const std::string temp_dir = "temp_frames";
@@ -203,27 +287,28 @@ int main(int argc, char* argv[]) {
     cv::Mat frame_img;
     size_t frame_count = 0;
 
-    const std::vector<uint8_t> bootstrap_buf = build_bootstrap(cfg);
-    render_frame(frame_img, bootstrap_buf, cfg, max_rows);
-    for (int i = 0; i < kBootstrapRepeat; ++i) {
-        write_frame(frame_img, temp_dir, frame_count);
-    }
-
-    const std::vector<uint8_t> stream_buf = build_stream_header(cfg, data.size(), total_frames);
-    render_frame(frame_img, stream_buf, cfg, max_rows);
-    for (int i = 0; i < kStreamHeaderRepeat; ++i) {
-        write_frame(frame_img, temp_dir, frame_count);
-    }
+    const std::vector<uint8_t> stream_buf =
+        build_stream_header(cfg, encoded_total_bytes, encoded_data_frames);
 
     std::vector<uint8_t> last_frame_buf;
-    for (uint32_t frame_index = 0; frame_index < total_frames; ++frame_index) {
-        const size_t offset = static_cast<size_t>(frame_index) * payload_per_frame;
-        const size_t remain = data.size() - offset;
-        const size_t chunk = std::min(remain, payload_per_frame);
+    size_t data_offset = 0;
+    for (uint32_t frame_index = 0; frame_index < encoded_data_frames; ++frame_index) {
+        const size_t chunk = frame_chunks[frame_index];
 
         std::vector<uint8_t> frame_buf =
-            build_frame_codeword(frame_index, total_frames, data, offset, chunk);
-        if (frame_index + 1 == total_frames) {
+            build_frame_codeword(frame_index, encoded_data_frames, cfg, data, data_offset, chunk);
+        data_offset += chunk;
+
+        if (frame_index == 0) {
+            std::vector<uint8_t> prefixed;
+            prefixed.reserve(bootstrap_buf.size() + stream_buf.size() + frame_buf.size());
+            prefixed.insert(prefixed.end(), bootstrap_buf.begin(), bootstrap_buf.end());
+            prefixed.insert(prefixed.end(), stream_buf.begin(), stream_buf.end());
+            prefixed.insert(prefixed.end(), frame_buf.begin(), frame_buf.end());
+            frame_buf = std::move(prefixed);
+        }
+
+        if (frame_index + 1 == encoded_data_frames) {
             last_frame_buf = frame_buf;
         }
 
@@ -278,6 +363,19 @@ int main(int argc, char* argv[]) {
         std::cerr << "Error: ffmpeg failed while encoding the video.\n";
         return static_cast<int>(ExitCode::EncodingError);
     }
+
+    const double actual_milliseconds = 1000.0 * static_cast<double>(encoded_total_output_frames) /
+        static_cast<double>(kFixedOutputFps);
+    std::cout << "target duration(ms): " << std::fixed << std::setprecision(3)
+              << max_milliseconds << "\n"
+              << "output frames      : " << encoded_total_output_frames << "\n"
+              << "output duration(ms): " << actual_milliseconds << "\n"
+              << "fec rs(data/parity): " << fec_cfg.rs_data_bytes
+              << "/" << fec_cfg.rs_parity_bytes << "\n"
+              << "non-data frames    : "
+              << (kBootstrapRepeat + kStreamHeaderRepeat + kFinalHeaderRepeat + kLastFrameRepeat) << "\n"
+              << "encoded data frames: " << encoded_data_frames << "/" << full_data_frames << "\n"
+              << "encoded bytes      : " << encoded_total_bytes << "/" << data.size() << "\n";
 
     return static_cast<int>(ExitCode::Ok);
 }

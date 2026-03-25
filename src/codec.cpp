@@ -976,9 +976,9 @@ bool rectify_frame_with_quad(
 EncoderConfig make_default_encoder_config(int fps) {
     EncoderConfig cfg;
     cfg.fps = fps;
-    cfg.cell_size = 16;
-    cfg.cells_per_row = 137;
-    cfg.payload_bytes_per_frame = 2400;
+    cfg.cell_size = 10;
+    cfg.cells_per_row = 219;
+    cfg.payload_bytes_per_frame = 6100;
     cfg.reference_block_size = 2;
     return cfg;
 }

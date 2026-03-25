@@ -21,6 +21,7 @@ find_package(OpenCV REQUIRED)
 add_library(camcom_core
   src/codec.cpp
   src/common.cpp
+  src/fec.cpp
   src/ffmpeg.cpp
   src/io.cpp
   src/tracker.cpp
