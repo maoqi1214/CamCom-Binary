@@ -2,20 +2,7 @@
 
 基于 `C++ / OpenCV / FFmpeg` 的可见光二进制传输实验项目。
 
-本版本重点满足项目一的提交要求：
 
-- 输入文件总长度会写入流头
-- 按给定时长生成视频，当前主要使用 `1000 ms`
-- 输出视频固定为 `20 FPS`
-- 在 1 秒内尽可能传输更多前缀数据
-- 如果 1 秒内传不完，剩余部分按 `0` 补齐
-- `vote / validity` 中对应未传输部分写 `0x00`，表示弃权
-
-项目一容忍错误率：
-
-```c
-#define TORRENT_ERR_RATE 0.0003
-```
 
 ## 环境
 
@@ -26,18 +13,13 @@
 
 Windows 下建议使用 Visual Studio。
 
-## 编译
+## 编译（若是Visual Studio 2022请将Visual Studio 18 2026替换成Visual Studio 17 2022，build-vs26替换成build-vs22，OpenCV_DIR设置成OpenCV中build目录的安装路径）
 
-如果已经有 `build-vs26`：
 
-```powershell
-cmake --build build-vs26 --config Release
-```
-
-如果需要首次生成工程：
+首次生成工程：
 
 ```powershell
-cmake -S . -B build-vs26 -G "Visual Studio 18 2026" -A x64
+cmake -S . -B build-vs26 -G "Visual Studio 18 2026" -A x64 -DOpenCV_DIR="C:\path\to\opencv\build"
 cmake --build build-vs26 --config Release
 ```
 
@@ -67,7 +49,7 @@ encode <输入文件> <输出视频> <时长毫秒>
 示例：
 
 ```powershell
-encode.exe 01.bin in1.mp4 1000
+encode 01.bin in1.mp4 1000
 ```
 
 含义：
@@ -87,7 +69,7 @@ decode <输入视频> <输出文件> <vote文件> <参考文件>
 示例：
 
 ```powershell
-decode.exe in1.mp4 out.bin out.vote.bin 01.bin
+decode in1.mp4 out.bin out.vote.bin 01.bin
 ```
 
 输出含义：
@@ -133,16 +115,16 @@ encode.exe 10.bin in10.mp4 1000
 如果你录完后得到 `out1.mp4` 到 `out10.mp4`，可以按对应关系分别解码：
 
 ```powershell
-decode.exe out1.mp4 out1.bin out1.vote.bin 01.bin
-decode.exe out2.mp4 out2.bin out2.vote.bin 02.bin
-decode.exe out3.mp4 out3.bin out3.vote.bin 03.bin
-decode.exe out4.mp4 out4.bin out4.vote.bin 04.bin
-decode.exe out5.mp4 out5.bin out5.vote.bin 05.bin
-decode.exe out6.mp4 out6.bin out6.vote.bin 06.bin
-decode.exe out7.mp4 out7.bin out7.vote.bin 07.bin
-decode.exe out8.mp4 out8.bin out8.vote.bin 08.bin
-decode.exe out9.mp4 out9.bin out9.vote.bin 09.bin
-decode.exe out10.mp4 out10.bin out10.vote.bin 10.bin
+decode.exe out1.mp4 out1.bin v1.bin 01.bin
+decode.exe out2.mp4 out2.bin v2.bin 02.bin
+decode.exe out3.mp4 out3.bin v3.bin 03.bin
+decode.exe out4.mp4 out4.bin v4.bin 04.bin
+decode.exe out5.mp4 out5.bin v5.bin 05.bin
+decode.exe out6.mp4 out6.bin v6.bin 06.bin
+decode.exe out7.mp4 out7.bin v7.bin 07.bin
+decode.exe out8.mp4 out8.bin v8.bin 08.bin
+decode.exe out9.mp4 out9.bin v9.bin 09.bin
+decode.exe out10.mp4 out10.bin v10.bin 10.bin
 ```
 
 ### 6. 如何看解码结果
@@ -185,14 +167,12 @@ encode <input.bin> <output.mp4> <duration_ms>
 命令：
 
 ```text
-decode <input.mp4> <output.bin> <validity.bin>
 decode <input.mp4> <output.bin> <validity.bin> <reference.bin>
 ```
 
 示例：
 
 ```powershell
-.\build-vs26\bin\Release\decode.exe .\out.mp4 .\output.bin .\vote.bin
 .\build-vs26\bin\Release\decode.exe .\out.mp4 .\output.bin .\vote.bin .\input.bin
 ```
 
