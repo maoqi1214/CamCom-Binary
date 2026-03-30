@@ -500,65 +500,6 @@ bool sample_frame_with_quad_hint(
     return true;
 }
 
-bool sample_fused_group_with_quad_hint(
-    const std::vector<cv::Mat>& group_frames,
-    const std::vector<std::pair<double, size_t>>& ranked_frames,
-    EncoderConfig& cfg,
-    const std::array<cv::Point2f, 4>* quad_hint,
-    std::vector<uint8_t>& sample_out) {
-    std::vector<cv::Mat> rectified_frames;
-    rectified_frames.reserve(std::min<size_t>(ranked_frames.size(), 5));
-
-    for (size_t i = 0; i < ranked_frames.size() && rectified_frames.size() < 5; ++i) {
-        const cv::Mat& frame = group_frames[ranked_frames[i].second];
-        if (frame.empty() || is_black_frame(frame)) {
-            continue;
-        }
-
-        cv::Mat rectified;
-        EncoderConfig trial_cfg = cfg;
-        bool rectified_ok = false;
-        if (quad_hint != nullptr) {
-            rectified_ok = rectify_frame_with_quad(frame, *quad_hint, trial_cfg, rectified);
-        }
-        if (!rectified_ok || rectified.empty()) {
-            rectified_ok = rectify_frame_geometry(frame, rectified, trial_cfg);
-        }
-        if (!rectified_ok || rectified.empty()) {
-            continue;
-        }
-
-        if (!rectified_frames.empty() &&
-            rectified.size() != rectified_frames.front().size()) {
-            cv::resize(rectified, rectified, rectified_frames.front().size(), 0.0, 0.0, cv::INTER_LINEAR);
-        }
-        rectified_frames.push_back(rectified);
-        cfg = trial_cfg;
-    }
-
-    if (rectified_frames.size() < 2) {
-        return false;
-    }
-
-    cv::Mat accum(rectified_frames.front().size(), CV_32FC3, cv::Scalar(0, 0, 0));
-    for (const auto& frame : rectified_frames) {
-        cv::Mat frame_f32;
-        frame.convertTo(frame_f32, CV_32FC3);
-        accum += frame_f32;
-    }
-
-    accum /= static_cast<float>(rectified_frames.size());
-    cv::Mat fused;
-    accum.convertTo(fused, CV_8UC3);
-
-    EncoderConfig fused_cfg = cfg;
-    if (!sample_frame(fused, sample_out, fused_cfg) || sample_out.empty()) {
-        return false;
-    }
-    cfg = fused_cfg;
-    return true;
-}
-
 void recover_grouped_frames(
     const std::unordered_map<uint32_t, RawFrameSampleGroup>& raw_frame_samples,
     const EncoderConfig& cfg,
@@ -1028,19 +969,6 @@ void process_frame_group(
         return false;
     };
 
-    if (sample_fused_group_with_quad_hint(
-            group_frames,
-            ranked_frames,
-            candidate_cfg,
-            have_quad_hint ? &quad_hint : nullptr,
-            samples.emplace_back())) {
-        if (best_successful_frame_index < 0 && !ranked_frames.empty()) {
-            best_successful_frame_index = static_cast<int>(ranked_frames.front().second);
-        }
-    } else if (!samples.empty() && samples.back().empty()) {
-        samples.pop_back();
-    }
-
     for (const size_t limit : stage_limits) {
         const size_t stage_end = std::min(limit, ranked_frames.size());
         for (; attempted_frames < stage_end; ++attempted_frames) {
@@ -1124,13 +1052,7 @@ bool decode_frames_from_video(
 
     std::vector<cv::Mat> screen_group_frames;
     cv::Mat previous_signature;
-    constexpr double kSameFrameThreshold = 1.2;
-    const int grouping_fps_hint = std::max(20, cfg.fps);
-    const double estimated_capture_ratio =
-        input_fps / static_cast<double>(grouping_fps_hint);
-    const size_t max_group_frames = screen_recording_mode
-        ? std::max<size_t>(3, static_cast<size_t>(std::ceil(estimated_capture_ratio * 2.0)))
-        : std::numeric_limits<size_t>::max();
+    constexpr double kSameFrameThreshold = 2.0;
 
     cv::Mat frame;
     while (cap.read(frame)) {
@@ -1141,13 +1063,8 @@ bool decode_frames_from_video(
         ++processed_frames;
         if (screen_recording_mode) {
             const cv::Mat signature = make_frame_signature(frame);
-            const bool signature_changed =
-                !screen_group_frames.empty() &&
-                signature_difference(previous_signature, signature) > kSameFrameThreshold;
-            const bool group_too_large =
-                !screen_group_frames.empty() &&
-                screen_group_frames.size() >= max_group_frames;
-            if (signature_changed || group_too_large) {
+            if (!screen_group_frames.empty() &&
+                signature_difference(previous_signature, signature) > kSameFrameThreshold) {
                 process_frame_group(
                     screen_group_frames,
                     cfg,
@@ -1258,7 +1175,6 @@ void recover_missing_frames_from_video_windows(
     }
 
     const double capture_fps = std::max(1.0, cap.get(cv::CAP_PROP_FPS));
-    const bool screen_recording_mode = capture_fps > 35.0;
     const double capture_ratio = capture_fps / static_cast<double>(cfg.fps);
     const int total_capture_frames = std::max(0, static_cast<int>(std::llround(cap.get(cv::CAP_PROP_FRAME_COUNT))));
     constexpr int kLeadInFrames = 6;
@@ -1277,26 +1193,6 @@ void recover_missing_frames_from_video_windows(
             return;
         }
 
-        EncoderConfig scan_cfg = cfg;
-        bool have_bootstrap = true;
-        bool have_stream_header = true;
-        uint64_t expected_total_bytes = 0;
-        std::unordered_map<uint32_t, std::vector<uint8_t>> recovered_candidates;
-        std::unordered_map<int, std::deque<std::vector<uint8_t>>> sample_histories;
-        std::unordered_map<uint32_t, RawFrameSampleGroup> raw_frame_samples;
-        std::unordered_map<uint64_t, int> frame_payload_votes;
-        std::unordered_map<uint32_t, uint32_t> frame_best_payload_crc;
-        TrackingDecodeState tracking;
-        std::vector<cv::Mat> screen_group_frames;
-        cv::Mat previous_signature;
-        constexpr double kSameFrameThreshold = 1.2;
-        const int grouping_fps_hint = std::max(20, scan_cfg.fps);
-        const double estimated_capture_ratio =
-            capture_fps / static_cast<double>(grouping_fps_hint);
-        const size_t max_group_frames = screen_recording_mode
-            ? std::max<size_t>(3, static_cast<size_t>(std::ceil(estimated_capture_ratio * 2.0)))
-            : std::numeric_limits<size_t>::max();
-
         size_t scanned_frames = 0;
         size_t last_scan_reported = static_cast<size_t>(-1);
         while (!missing_set.empty() && cap.read(frame)) {
@@ -1305,55 +1201,21 @@ void recover_missing_frames_from_video_windows(
             }
             ++scanned_frames;
 
-            EncoderConfig direct_cfg = scan_cfg;
-            std::vector<uint8_t> direct_sample;
-            if (sample_frame(frame, direct_sample, direct_cfg)) {
-                FrameHeader hdr{};
-                std::vector<uint8_t> payload;
-                if (try_parse_data_frame(direct_sample, direct_cfg, hdr, payload) &&
-                    missing_set.erase(hdr.frame_index) > 0) {
-                    frames_buffer[hdr.frame_index] = std::move(payload);
-                    ++recovered_count;
-                }
+            EncoderConfig candidate_cfg = cfg;
+            std::vector<uint8_t> sample;
+            if (!sample_frame(frame, sample, candidate_cfg)) {
+                continue;
             }
 
-            if (screen_recording_mode && !missing_set.empty()) {
-                const cv::Mat signature = make_frame_signature(frame);
-                const bool signature_changed =
-                    !screen_group_frames.empty() &&
-                    signature_difference(previous_signature, signature) > kSameFrameThreshold;
-                const bool group_too_large =
-                    !screen_group_frames.empty() &&
-                    screen_group_frames.size() >= max_group_frames;
-                if (signature_changed || group_too_large) {
-                    process_frame_group(
-                        screen_group_frames,
-                        scan_cfg,
-                        have_bootstrap,
-                        have_stream_header,
-                        expected_total_frames,
-                        expected_total_bytes,
-                        recovered_candidates,
-                        raw_frame_samples,
-                        tracking,
-                        frame_payload_votes,
-                        frame_best_payload_crc);
-                }
-                previous_signature = signature;
-                screen_group_frames.push_back(frame.clone());
-            } else {
-                process_frame(
-                    frame,
-                    scan_cfg,
-                    have_bootstrap,
-                    have_stream_header,
-                    expected_total_frames,
-                    expected_total_bytes,
-                    recovered_candidates,
-                    sample_histories,
-                    raw_frame_samples,
-                    frame_payload_votes,
-                    frame_best_payload_crc);
+            FrameHeader hdr{};
+            std::vector<uint8_t> payload;
+            if (!try_parse_data_frame(sample, candidate_cfg, hdr, payload)) {
+                continue;
+            }
+
+            if (missing_set.erase(hdr.frame_index) > 0) {
+                frames_buffer[hdr.frame_index] = std::move(payload);
+                ++recovered_count;
             }
 
             if (total_capture_frames > 0 &&
@@ -1362,29 +1224,6 @@ void recover_missing_frames_from_video_windows(
                  scanned_frames - last_scan_reported >= 20)) {
                 print_recovery_progress_bar(scanned_frames, static_cast<size_t>(total_capture_frames));
                 last_scan_reported = scanned_frames;
-            }
-        }
-
-        if (screen_recording_mode) {
-            process_frame_group(
-                screen_group_frames,
-                scan_cfg,
-                have_bootstrap,
-                have_stream_header,
-                expected_total_frames,
-                expected_total_bytes,
-                recovered_candidates,
-                raw_frame_samples,
-                tracking,
-                frame_payload_votes,
-                frame_best_payload_crc);
-        }
-
-        recover_grouped_frames(raw_frame_samples, scan_cfg, recovered_candidates);
-        for (auto& [frame_index, payload] : recovered_candidates) {
-            if (missing_set.erase(frame_index) > 0) {
-                frames_buffer[frame_index] = std::move(payload);
-                ++recovered_count;
             }
         }
 
@@ -1519,10 +1358,10 @@ int main(int argc, char* argv[]) {
             frames_buffer);
     }
 
+    const bool need_frame_validity = reference_path.empty();
     std::vector<uint8_t> recovered;
     std::vector<uint8_t> validity_mask;
-    uint64_t recovered_bytes = 0;
-    if (expected_total_bytes > 0) {
+    if (need_frame_validity && expected_total_bytes > 0) {
         validity_mask.reserve(static_cast<size_t>(expected_total_bytes));
     }
     std::cout << "decoded frames : " << frames_buffer.size() << "\n";
@@ -1537,9 +1376,10 @@ int main(int argc, char* argv[]) {
             const auto it = frames_buffer.find(i);
             if (it != frames_buffer.end() && !it->second.empty()) {
                 recovered.insert(recovered.end(), it->second.begin(), it->second.end());
-                validity_mask.insert(validity_mask.end(), it->second.size(), 0xFF);
+                if (need_frame_validity) {
+                    validity_mask.insert(validity_mask.end(), it->second.size(), 0xFF);
+                }
                 current_size += it->second.size();
-                recovered_bytes += it->second.size();
                 continue;
             }
 
@@ -1552,57 +1392,41 @@ int main(int argc, char* argv[]) {
                 pad_size = static_cast<size_t>(expected_total_bytes - current_size);
             }
             recovered.insert(recovered.end(), pad_size, 0x00);
-            validity_mask.insert(validity_mask.end(), pad_size, 0x00);
+            if (need_frame_validity) {
+                validity_mask.insert(validity_mask.end(), pad_size, 0x00);
+            }
             current_size += pad_size;
-        }
-
-        if (expected_total_bytes > 0 && recovered.size() < expected_total_bytes) {
-            const size_t tail_pad_size =
-                static_cast<size_t>(expected_total_bytes - recovered.size());
-            recovered.insert(recovered.end(), tail_pad_size, 0x00);
-            validity_mask.insert(validity_mask.end(), tail_pad_size, 0x00);
         }
 
         if (expected_total_bytes > 0 && recovered.size() > expected_total_bytes) {
             recovered.resize(static_cast<size_t>(expected_total_bytes));
-            validity_mask.resize(static_cast<size_t>(expected_total_bytes));
+            if (need_frame_validity) {
+                validity_mask.resize(static_cast<size_t>(expected_total_bytes));
+            }
         }
     }
 
     try {
         write_binary_file(output_path, recovered);
-        write_binary_file(validity_path, validity_mask);
         if (!reference_path.empty()) {
             const auto reference = read_binary_file(reference_path);
+            std::vector<uint8_t> validity_exact(reference.size(), 0x00);
             const size_t compare_len = std::min(reference.size(), recovered.size());
             size_t matched = 0;
-            size_t compared = 0;
             for (size_t i = 0; i < compare_len; ++i) {
-                if (i >= validity_mask.size() || validity_mask[i] == 0x00) {
-                    continue;
-                }
-                ++compared;
                 if (reference[i] == recovered[i]) {
+                    validity_exact[i] = 0xFF;
                     ++matched;
                 }
             }
 
+            write_binary_file(validity_path, validity_exact);
             std::cout << "output bytes   : " << recovered.size() << "\n"
                       << "reference bytes: " << reference.size() << "\n"
-                      << "validity bytes : " << validity_mask.size() << "\n"
-                      << "compared bytes : " << compared << "\n"
-                      << "recovered bytes: " << recovered_bytes << "\n"
-                      << "abstained bytes: "
-                      << (compare_len > compared ? compare_len - compared : 0) << "\n"
+                      << "validity bytes : " << validity_exact.size() << "\n"
+                      << "compared bytes : " << compare_len << "\n"
                       << "matched bytes  : " << matched << "\n"
                       << "accuracy       : "
-                      << std::fixed << std::setprecision(2)
-                      << (compared == 0
-                              ? 0.0
-                              : 100.0 * static_cast<double>(matched) /
-                                    static_cast<double>(compared))
-                      << "%\n"
-                      << "full accuracy  : "
                       << std::fixed << std::setprecision(2)
                       << (reference.empty()
                               ? 0.0
@@ -1610,12 +1434,8 @@ int main(int argc, char* argv[]) {
                                     static_cast<double>(reference.size()))
                       << "%\n";
         } else {
+            write_binary_file(validity_path, validity_mask);
             std::cout << "output bytes   : " << recovered.size() << "\n"
-                      << "recovered bytes: " << recovered_bytes << "\n"
-                      << "abstained bytes: "
-                      << (recovered.size() > static_cast<size_t>(recovered_bytes)
-                              ? recovered.size() - static_cast<size_t>(recovered_bytes)
-                              : 0) << "\n"
                       << "validity bytes : " << validity_mask.size() << "\n";
         }
     } catch (const std::exception& ex) {

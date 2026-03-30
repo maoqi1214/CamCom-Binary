@@ -1,163 +1,244 @@
 # CamCom-Binary
 
-`CamCom-Binary` 是一个基于 C++、OpenCV 和 FFmpeg 的可见光传输实验项目。它将二进制文件编码为一系列彩色码帧并生成视频，再从屏幕录制或手机拍摄的视频中恢复出原始二进制数据。
+基于 `C++ / OpenCV / FFmpeg` 的可见光二进制传输实验项目。
 
-项目当前提供两个命令行程序：
+本版本重点满足项目一的提交要求：
 
-- `encode`：将二进制文件编码为视频
-- `decode`：从视频中解码出二进制文件
+- 输入文件总长度会写入流头
+- 按给定时长生成视频，当前主要使用 `1000 ms`
+- 输出视频固定为 `20 FPS`
+- 在 1 秒内尽可能传输更多前缀数据
+- 如果 1 秒内传不完，剩余部分按 `0` 补齐
+- `vote / validity` 中对应未传输部分写 `0x00`，表示弃权
 
-## 特性
+项目一容忍错误率：
 
-- 保留彩色编码，每个单元格承载 2 bit 信息
-- 固定 `15 FPS` 输出
-- 使用四角定位点进行检测和透视矫正
-- 支持原始生成视频回解，也支持手机录制视频解码
-- 解码端包含分组采样、QuadTracker 跟踪和多候选恢复逻辑
-- 数据帧启用分块 `RS(255,223)` 帧内纠错与交织
+```c
+#define TORRENT_ERR_RATE 0.0003
+```
 
-## 依赖
+## 环境
 
-- CMake 3.16 及以上
+- CMake 3.16+
 - 支持 C++17 的编译器
 - OpenCV
 - FFmpeg
-- Windows 下推荐使用 Visual Studio 2026 或 Visual Studio 2022
 
-## 构建
+Windows 下建议使用 Visual Studio。
 
-### Visual Studio 2026
+## 编译
+
+如果已经有 `build-vs26`：
 
 ```powershell
-Set-Location C:\path\to\CamCom-Binary
-cmake -S . -B build-vs26 -G "Visual Studio 18 2026" -A x64 -DOpenCV_DIR="C:\path\to\opencv\build\x64\vc16\lib"
 cmake --build build-vs26 --config Release
 ```
 
-### Visual Studio 2022
+如果需要首次生成工程：
 
 ```powershell
-Set-Location C:\path\to\CamCom-Binary
-cmake -S . -B build-vs22 -G "Visual Studio 17 2022" -A x64 -DOpenCV_DIR="C:\path\to\opencv\build\x64\vc16\lib"
-cmake --build build-vs22 --config Release
+cmake -S . -B build-vs26 -G "Visual Studio 18 2026" -A x64
+cmake --build build-vs26 --config Release
 ```
 
-构建完成后可执行文件默认位于：
+生成的可执行文件位于：
 
 ```text
 build-vs26\bin\Release\encode.exe
 build-vs26\bin\Release\decode.exe
 ```
 
-或：
+建议后续所有命令都在 `build-vs26\bin\Release` 目录下执行：
 
-```text
-build-vs22\bin\Release\encode.exe
-build-vs22\bin\Release\decode.exe
+```powershell
+cd .\build-vs26\bin\Release
 ```
 
-## 用法
+## 基本操作
 
-### encode
+### 1. 生成 1 秒视频
+
+命令格式：
 
 ```text
-encode <input.bin> <output.mp4> <max_milliseconds>
+encode <输入文件> <输出视频> <时长毫秒>
 ```
 
 示例：
 
 ```powershell
-.\build-vs26\bin\Release\encode.exe .\input.bin .\output.mp4 15000
+encode.exe 01.bin in1.mp4 1000
+```
+
+含义：
+
+- 把 `01.bin` 编码成 `in1.mp4`
+- 视频时长严格为 `1000 ms`
+- 当前固定输出为 `20 FPS`
+
+### 2. 直接回解生成的视频
+
+命令格式：
+
+```text
+decode <输入视频> <输出文件> <vote文件> <参考文件>
+```
+
+示例：
+
+```powershell
+decode.exe in1.mp4 out.bin out.vote.bin 01.bin
+```
+
+输出含义：
+
+- `out.bin`：解码得到的结果
+- `out.vote.bin`：与输出等长的投票文件
+- `01.bin`：参考文件，用来计算正确率
+
+### 3. 解码录屏或实拍视频
+
+如果你录下了播放过程，例如得到 `out1.mp4`，可以这样解码：
+
+```powershell
+decode.exe out1.mp4 out1.bin out1.vote.bin 01.bin
+```
+
+其中：
+
+- `out1.mp4`：录屏或拍摄后得到的视频
+- `out1.bin`：恢复出的数据
+- `out1.vote.bin`：每个字节是否有效
+- `01.bin`：原始参考文件
+
+### 4. 批量生成 1 秒视频
+
+如果目录下有 `01.bin` 到 `10.bin`，可以逐个生成：
+
+```powershell
+encode.exe 01.bin in1.mp4 1000
+encode.exe 02.bin in2.mp4 1000
+encode.exe 03.bin in3.mp4 1000
+encode.exe 04.bin in4.mp4 1000
+encode.exe 05.bin in5.mp4 1000
+encode.exe 06.bin in6.mp4 1000
+encode.exe 07.bin in7.mp4 1000
+encode.exe 08.bin in8.mp4 1000
+encode.exe 09.bin in9.mp4 1000
+encode.exe 10.bin in10.mp4 1000
+```
+
+### 5. 批量解码录屏结果
+
+如果你录完后得到 `out1.mp4` 到 `out10.mp4`，可以按对应关系分别解码：
+
+```powershell
+decode.exe out1.mp4 out1.bin out1.vote.bin 01.bin
+decode.exe out2.mp4 out2.bin out2.vote.bin 02.bin
+decode.exe out3.mp4 out3.bin out3.vote.bin 03.bin
+decode.exe out4.mp4 out4.bin out4.vote.bin 04.bin
+decode.exe out5.mp4 out5.bin out5.vote.bin 05.bin
+decode.exe out6.mp4 out6.bin out6.vote.bin 06.bin
+decode.exe out7.mp4 out7.bin out7.vote.bin 07.bin
+decode.exe out8.mp4 out8.bin out8.vote.bin 08.bin
+decode.exe out9.mp4 out9.bin out9.vote.bin 09.bin
+decode.exe out10.mp4 out10.bin out10.vote.bin 10.bin
+```
+
+### 6. 如何看解码结果
+
+程序会输出几项核心信息：
+
+- `decoded frames`：成功恢复了多少个数据帧
+- `total frames`：理论总数据帧数
+- `compared bytes`：实际参与比较的字节数
+- `matched bytes`：与参考文件一致的字节数
+- `accuracy`：只统计参与投票部分的准确率
+- `full accuracy`：按整个原始文件统计的准确率
+
+如果 `accuracy = 100%`，说明已经成功恢复出的那部分数据是完全正确的。
+如果 `full accuracy` 很低，通常表示 1 秒内只传输了原文件的一部分，这在当前规则下是正常的。
+
+## 编码
+
+命令：
+
+```text
+encode <input.bin> <output.mp4> <duration_ms>
+```
+
+示例：
+
+```powershell
+.\build-vs26\bin\Release\encode.exe .\input.bin .\out.mp4 1000
 ```
 
 说明：
 
-- 第一个参数：输入二进制文件
-- 第二个参数：输出视频路径
-- 第三个参数：允许生成视频的最大时长，单位毫秒
-- 当前编码器固定输出 `15 FPS`
+- `1000` 表示严格生成 `1 秒` 视频
+- 当前编码参数固定为 `20 FPS`
+- 视频只传前面能装下的数据
+- 流头记录原始输入文件总长度
 
-### decode
+## 解码
 
-三参数模式：
+命令：
 
 ```text
 decode <input.mp4> <output.bin> <validity.bin>
-```
-
-四参数模式：
-
-```text
 decode <input.mp4> <output.bin> <validity.bin> <reference.bin>
 ```
 
 示例：
 
 ```powershell
-.\build-vs26\bin\Release\decode.exe .\input.mp4 .\output.bin .\validity.bin
-.\build-vs26\bin\Release\decode.exe .\input.mp4 .\output.bin .\validity.bin .\input.bin
+.\build-vs26\bin\Release\decode.exe .\out.mp4 .\output.bin .\vote.bin
+.\build-vs26\bin\Release\decode.exe .\out.mp4 .\output.bin .\vote.bin .\input.bin
 ```
 
 说明：
 
-- 三参数模式下，`validity.bin` 表示逐字节恢复有效性
-- 四参数模式下，`validity.bin` 表示与参考文件逐字节比较后的正确性掩码
+- `output.bin` 为恢复结果
+- `validity.bin` / `vote.bin` 与输出等长
+- 成功恢复的位置写 `0xFF`
+- 未恢复或未传输的位置写 `0x00`
 
-## 编码方式概述
+## 正确率含义
 
-编码器会生成以下几类帧：
+提供参考文件时，程序会输出两类指标：
 
-- `bootstrap`：编码参数信息
-- `stream header`：总字节数、总帧数等流信息
-- 数据帧：实际二进制载荷
-- 重复帧：用于提升尾部恢复稳定性
+- `accuracy`：只统计参与投票的字节
+- `full accuracy`：按整个原始文件长度统计
 
-每个字节会拆成 4 个 2-bit 符号，并映射到彩色单元格中。当前实现保留彩色编码，不是黑白二维码方案。
+因此，当 1 秒内只能传输一部分数据时：
 
-## 默认参数
+- `accuracy` 可能很高
+- `full accuracy` 会明显更低
 
-当前代码中的默认参数为：
+这是当前设计下的正常现象。
 
-- 输出帧率：`15 FPS`
-- `cell_size`：`10`
-- 每行单元数：`219`
-- 每列单元数：`112`
-- 码面 payload 容量：`6100 byte/frame`
-- 用户有效载荷：`5332 byte/frame`
-- 理论有效传输速率：`5332 x 15 = 79980 byte/s`，约为 `80.0 KB/s`，即 `640 kbps`
-- 纠错参数：`RS(255,223)`，交织深度 `4`
+## 当前默认参数
 
-其中每帧数据字节数的来源如下：
+- `fps = 20`
+- `cell_size = 10`
+- `cells_per_row = 219`
+- `reference_block_size = 2`
+- `payload_bytes_per_frame = 6100`
 
-- 当前数据区共有 `219 x 112 = 24528` 个单元格
-- 每个单元格表示 `2 bit`
-- `4` 个单元格组成 `1 byte`
-- 因此整帧最多约可表示 `24528 / 4 = 6132` 字节
-- 数据帧头固定占用 `4 + 1 + 4 + 4 + 4 + 4 = 21` 字节
-- 所以理论上的有效载荷上限约为 `6132 - 21 = 6111` 字节
-- 当前代码将码面 payload 容量设置为 `6100` 字节，保留少量余量以提高布局和解码稳定性
-- 由于启用了 `RS(255,223)`，`6100` 字节中并不全是用户数据
-- 按当前纠错参数换算后，每帧实际可承载的用户有效载荷约为 `5332` 字节
+## 主要源码
 
-## 项目结构
+- `src/encoder.cpp`：编码入口
+- `src/decoder.cpp`：解码入口
+- `src/codec.cpp`：画面渲染与采样
+- `src/fec.cpp`：FEC 编解码
+- `src/ffmpeg.cpp`：FFmpeg 调用
+
+## 目录
 
 ```text
 CamCom-Binary/
-├─ include/
-├─ src/
-├─ CMakeLists.txt
-└─ README.md
+|-- include/
+|-- src/
+|-- CMakeLists.txt
+`-- README.md
 ```
-
-主要源码文件：
-
-- `src/encoder.cpp`：编码器入口
-- `src/decoder.cpp`：解码器入口
-- `src/codec.cpp`：渲染、定位、矫正、采样
-- `src/tracker.cpp`：跟踪与 Kalman 相关逻辑
-
-## 使用建议
-
-- 先对原始生成视频做一次直接回解，确认编解码链路本身正常
-- 再进行全屏播放和手机录制测试
-- 拍摄时尽量保证码面完整入镜，避免强反光和曝光剧烈变化

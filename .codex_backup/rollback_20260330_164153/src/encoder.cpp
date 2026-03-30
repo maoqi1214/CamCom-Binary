@@ -26,13 +26,13 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr int kFixedOutputFps = 20;
+constexpr double kStrictOutputDurationMs = 1000.0;
 constexpr int kBootstrapRepeat = 0;
 constexpr int kStreamHeaderRepeat = 0;
 constexpr int kLastFrameRepeat = 0;
 constexpr int kFinalHeaderRepeat = 0;
 constexpr int kFixedOverheadFrames = kBootstrapRepeat + kStreamHeaderRepeat + kFinalHeaderRepeat;
 constexpr size_t kFrameHeaderBytes = 4 + 1 + 4 + 4 + 4 + 4;
-constexpr size_t kPaddingFramePayloadBytes = 1;
 
 void print_usage(const char* argv0) {
     std::cerr
@@ -93,16 +93,21 @@ std::vector<uint8_t> build_frame_codeword(
     uint32_t frame_index,
     uint32_t total_frames,
     const EncoderConfig& cfg,
-    const std::vector<uint8_t>& source_payload) {
+    const std::vector<uint8_t>& data,
+    size_t offset,
+    size_t chunk) {
     std::vector<uint8_t> frame_buf;
     serialize_u32(frame_buf, MAGIC);
     serialize_u8(frame_buf, FORMAT_VERSION);
     serialize_u32(frame_buf, frame_index);
     serialize_u32(frame_buf, total_frames);
-    serialize_u32(frame_buf, static_cast<uint32_t>(source_payload.size()));
+    serialize_u32(frame_buf, static_cast<uint32_t>(chunk));
 
     const size_t checksum_pos = frame_buf.size();
     serialize_u32(frame_buf, 0);
+    const std::vector<uint8_t> source_payload(
+        data.begin() + static_cast<std::ptrdiff_t>(offset),
+        data.begin() + static_cast<std::ptrdiff_t>(offset + chunk));
     const std::vector<uint8_t> encoded_payload =
         fec_encode_payload(source_payload, static_cast<size_t>(cfg.payload_bytes_per_frame));
     frame_buf.insert(frame_buf.end(), encoded_payload.begin(), encoded_payload.end());
@@ -114,15 +119,6 @@ std::vector<uint8_t> build_frame_codeword(
     frame_buf[checksum_pos + 3] = static_cast<uint8_t>((checksum >> 24) & 0xFFu);
 
     return frame_buf;
-}
-
-std::vector<uint8_t> slice_payload(
-    const std::vector<uint8_t>& data,
-    size_t offset,
-    size_t chunk) {
-    return std::vector<uint8_t>(
-        data.begin() + static_cast<std::ptrdiff_t>(offset),
-        data.begin() + static_cast<std::ptrdiff_t>(offset + chunk));
 }
 
 void write_frame(const cv::Mat& img, const std::string& temp_dir, size_t& frame_count) {
@@ -207,18 +203,19 @@ int main(int argc, char* argv[]) {
 
     const std::string input_path = argv[1];
     const std::string output_path = argv[2];
-    double max_milliseconds = 0.0;
+    double requested_milliseconds = 0.0;
     try {
-        max_milliseconds = std::stod(argv[3]);
+        requested_milliseconds = std::stod(argv[3]);
     } catch (const std::exception&) {
         std::cerr << "Error: max_milliseconds must be a number.\n";
         return static_cast<int>(ExitCode::BadArgs);
     }
 
-    if (!(max_milliseconds > 0.0)) {
+    if (!(requested_milliseconds > 0.0)) {
         std::cerr << "Error: max_milliseconds must be > 0.\n";
         return static_cast<int>(ExitCode::BadArgs);
     }
+    const double max_milliseconds = kStrictOutputDurationMs;
     if (!file_exists(input_path)) {
         std::cerr << "Error: input file not found: " << input_path << "\n";
         return static_cast<int>(ExitCode::IoError);
@@ -273,19 +270,16 @@ int main(int argc, char* argv[]) {
         encoded_total_bytes += chunk;
     }
 
-    if (frame_chunks.empty() || encoded_total_bytes == 0) {
+    const uint32_t encoded_data_frames = static_cast<uint32_t>(frame_chunks.size());
+    if (encoded_data_frames == 0 || encoded_total_bytes == 0) {
         std::cerr << "Error: no payload frame can be encoded under current max_milliseconds.\n";
         return static_cast<int>(ExitCode::BadArgs);
     }
-    while (frame_chunks.size() < max_data_frames_by_time) {
-        frame_chunks.push_back(kPaddingFramePayloadBytes);
-    }
-    const uint32_t encoded_data_frames = static_cast<uint32_t>(frame_chunks.size());
     const size_t encoded_total_output_frames = calculate_total_output_frames(encoded_data_frames);
 
     const int max_codeword_bytes = static_cast<int>(kFrameHeaderBytes) + cfg.payload_bytes_per_frame;
-    const int max_cells = max_codeword_bytes * 4;
-    const int max_rows = static_cast<int>((max_cells + cfg.cells_per_row - 1) / cfg.cells_per_row);
+    const int max_rows =
+        payload_rows_for_byte_count(static_cast<size_t>(max_codeword_bytes), cfg);
     const std::string temp_dir = "temp_frames";
     if (fs::exists(temp_dir)) {
         fs::remove_all(temp_dir);
@@ -300,20 +294,12 @@ int main(int argc, char* argv[]) {
 
     std::vector<uint8_t> last_frame_buf;
     size_t data_offset = 0;
-    const std::vector<uint8_t> padding_payload(kPaddingFramePayloadBytes, 0x00);
     for (uint32_t frame_index = 0; frame_index < encoded_data_frames; ++frame_index) {
         const size_t chunk = frame_chunks[frame_index];
-        std::vector<uint8_t> source_payload;
-        if (data_offset < data.size()) {
-            const size_t real_chunk = std::min(chunk, data.size() - data_offset);
-            source_payload = slice_payload(data, data_offset, real_chunk);
-            data_offset += real_chunk;
-        } else {
-            source_payload = padding_payload;
-        }
 
         std::vector<uint8_t> frame_buf =
-            build_frame_codeword(frame_index, encoded_data_frames, cfg, source_payload);
+            build_frame_codeword(frame_index, encoded_data_frames, cfg, data, data_offset, chunk);
+        data_offset += chunk;
 
         if (frame_index == 0) {
             std::vector<uint8_t> prefixed;
@@ -384,15 +370,19 @@ int main(int argc, char* argv[]) {
         static_cast<double>(kFixedOutputFps);
     std::cout << "target duration(ms): " << std::fixed << std::setprecision(3)
               << max_milliseconds << "\n"
+              << "requested duration : " << requested_milliseconds << "\n"
               << "output frames      : " << encoded_total_output_frames << "\n"
               << "output duration(ms): " << actual_milliseconds << "\n"
+              << "cell size          : " << cfg.cell_size << "\n"
+              << "cells per row      : " << cfg.cells_per_row << "\n"
+              << "payload bytes/frame: " << cfg.payload_bytes_per_frame << "\n"
               << "fec rs(data/parity): " << fec_cfg.rs_data_bytes
               << "/" << fec_cfg.rs_parity_bytes << "\n"
               << "non-data frames    : "
               << (kBootstrapRepeat + kStreamHeaderRepeat + kFinalHeaderRepeat + kLastFrameRepeat) << "\n"
               << "encoded data frames: " << encoded_data_frames << "/" << full_data_frames << "\n"
               << "encoded bytes      : " << encoded_total_bytes << "/" << data.size() << "\n"
-              << "padded tail bytes  : "
+              << "zero-filled tail   : "
               << (data.size() > encoded_total_bytes ? data.size() - encoded_total_bytes : 0) << "\n";
 
     return static_cast<int>(ExitCode::Ok);
