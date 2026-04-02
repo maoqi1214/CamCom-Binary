@@ -285,7 +285,7 @@ int main(int argc, char* argv[]) {
 
     const int max_codeword_bytes = static_cast<int>(kFrameHeaderBytes) + cfg.payload_bytes_per_frame;
     const int max_cells = max_codeword_bytes * 4;
-    const int max_rows = static_cast<int>((max_cells + cfg.cells_per_row - 1) / cfg.cells_per_row);
+    const int max_rows = required_total_rows_for_payload_cells(cfg, max_cells);
     const std::string temp_dir = "temp_frames";
     if (fs::exists(temp_dir)) {
         fs::remove_all(temp_dir);

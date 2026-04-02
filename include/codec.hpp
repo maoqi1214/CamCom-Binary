@@ -26,6 +26,7 @@ struct EncoderConfig {
 };
 
 EncoderConfig make_default_encoder_config(int fps = DEFAULT_FPS);
+int required_total_rows_for_payload_cells(const EncoderConfig& cfg, int payload_cells);
 
 void render_frame(
     cv::Mat& out,

@@ -53,6 +53,106 @@ struct FinderCandidate {
     std::array<cv::Point2f, 4> box{};
 };
 
+struct LayoutCell {
+    int row = 0;
+    int col = 0;
+};
+
+int layout_total_cols(const EncoderConfig& cfg) {
+    return cfg.cells_per_row + 2 * FINDER_MARKER_CELLS;
+}
+
+int layout_ref_top_row() {
+    return 1;
+}
+
+int layout_ref_left_col() {
+    return FINDER_MARKER_CELLS + 2;
+}
+
+bool cell_in_rect(int row, int col, int top, int left, int height, int width) {
+    return row >= top && row < top + height && col >= left && col < left + width;
+}
+
+void reserve_rect(
+    std::vector<uint8_t>& mask,
+    int total_rows,
+    int total_cols,
+    int top,
+    int left,
+    int height,
+    int width,
+    int padding = 0) {
+    const int r0 = std::max(0, top - padding);
+    const int c0 = std::max(0, left - padding);
+    const int r1 = std::min(total_rows, top + height + padding);
+    const int c1 = std::min(total_cols, left + width + padding);
+    for (int row = r0; row < r1; ++row) {
+        for (int col = c0; col < c1; ++col) {
+            mask[static_cast<size_t>(row) * static_cast<size_t>(total_cols) + static_cast<size_t>(col)] = 1;
+        }
+    }
+}
+
+std::vector<uint8_t> build_reserved_cell_mask(int total_rows, const EncoderConfig& cfg) {
+    const int total_cols = layout_total_cols(cfg);
+    std::vector<uint8_t> mask(static_cast<size_t>(total_rows) * static_cast<size_t>(total_cols), 0);
+
+    const int marker = FINDER_MARKER_CELLS;
+    const int small = 2;
+    const int ref = std::max(1, cfg.reference_block_size);
+
+    reserve_rect(mask, total_rows, total_cols, 0, 0, marker, marker, 1);
+    reserve_rect(mask, total_rows, total_cols, 0, total_cols - marker, marker, marker, 1);
+    reserve_rect(mask, total_rows, total_cols, total_rows - marker, 0, marker, marker, 1);
+    reserve_rect(mask, total_rows, total_cols, total_rows - marker, total_cols - marker, marker, marker, 1);
+
+    const int top_small_col = std::max(0, (total_cols - small) / 2);
+    const int left_small_row = std::max(0, (total_rows - small) / 2);
+    reserve_rect(mask, total_rows, total_cols, 0, top_small_col, small, small, 1);
+    reserve_rect(mask, total_rows, total_cols, total_rows - small, top_small_col, small, small, 1);
+    reserve_rect(mask, total_rows, total_cols, left_small_row, 0, small, small, 1);
+    reserve_rect(mask, total_rows, total_cols, left_small_row, total_cols - small, small, small, 1);
+
+    const int ref_row = layout_ref_top_row();
+    const int ref_col0 = layout_ref_left_col();
+    const int ref_stride = ref + 1;
+    for (int k = 0; k < 4; ++k) {
+        reserve_rect(mask, total_rows, total_cols, ref_row, ref_col0 + k * ref_stride, ref, ref, 1);
+    }
+
+    return mask;
+}
+
+std::vector<LayoutCell> build_data_cells(int total_rows, const EncoderConfig& cfg) {
+    const int total_cols = layout_total_cols(cfg);
+    const std::vector<uint8_t> reserved = build_reserved_cell_mask(total_rows, cfg);
+    std::vector<LayoutCell> cells;
+    cells.reserve(static_cast<size_t>(total_rows) * static_cast<size_t>(total_cols));
+    for (int row = 0; row < total_rows; ++row) {
+        for (int col = 0; col < total_cols; ++col) {
+            if (reserved[static_cast<size_t>(row) * static_cast<size_t>(total_cols) + static_cast<size_t>(col)] != 0) {
+                continue;
+            }
+            cells.push_back(LayoutCell{row, col});
+        }
+    }
+    return cells;
+}
+
+int layout_capacity_cells(int total_rows, const EncoderConfig& cfg) {
+    return static_cast<int>(build_data_cells(total_rows, cfg).size());
+}
+
+int minimum_total_rows_for_cells(int payload_cells, const EncoderConfig& cfg) {
+    const int min_rows = 2 * FINDER_MARKER_CELLS + 2;
+    int total_rows = min_rows;
+    while (layout_capacity_cells(total_rows, cfg) < payload_cells) {
+        ++total_rows;
+    }
+    return total_rows;
+}
+
 int color_distance_sq(const cv::Scalar& a, const cv::Scalar& b) {
     const int db = static_cast<int>(a[0] - b[0]);
     const int dg = static_cast<int>(a[1] - b[1]);
@@ -127,9 +227,9 @@ void expected_canvas_size(const EncoderConfig& cfg, int& target_w, int& target_h
     const int frame_header_bytes = 4 + 1 + 4 + 4 + 4 + 4;
     const int max_codeword_bytes = frame_header_bytes + cfg.payload_bytes_per_frame;
     const int max_cells = max_codeword_bytes * 4;
-    const int max_rows = std::max(1, (max_cells + cfg.cells_per_row - 1) / cfg.cells_per_row);
-    target_w = (cfg.cells_per_row + 2 * FINDER_MARKER_CELLS) * cfg.cell_size;
-    target_h = (max_rows + 2 * FINDER_MARKER_CELLS) * cfg.cell_size;
+    const int total_rows = minimum_total_rows_for_cells(max_cells, cfg);
+    target_w = layout_total_cols(cfg) * cfg.cell_size;
+    target_h = total_rows * cfg.cell_size;
 }
 
 cv::Rect clamp_rect_to_image(const cv::Rect& rect, const cv::Size& image_size) {
@@ -769,12 +869,11 @@ bool warp_with_finders(const cv::Mat& src, cv::Mat& warped, const EncoderConfig&
 }
 
 cv::Mat center_crop_expected_layout(const cv::Mat& src, const EncoderConfig& cfg) {
-    const int payload_cells = cfg.payload_bytes_per_frame * 4;
-    const int rows = std::max(1, (payload_cells + cfg.cells_per_row - 1) / cfg.cells_per_row);
-    const int expected_w_cells = cfg.cells_per_row + 2 * FINDER_MARKER_CELLS;
-    const int expected_h_cells = rows + 2 * FINDER_MARKER_CELLS;
+    int target_w = 0;
+    int target_h = 0;
+    expected_canvas_size(cfg, target_w, target_h);
     const double expected_aspect =
-        static_cast<double>(expected_w_cells) / static_cast<double>(expected_h_cells);
+        static_cast<double>(target_w) / std::max(1.0, static_cast<double>(target_h));
 
     int crop_w = src.cols;
     int crop_h = static_cast<int>(std::round(crop_w / expected_aspect));
@@ -912,27 +1011,29 @@ bool derive_grid_from_markers(
         (markers[0].height + markers[1].height + markers[2].height + markers[3].height) /
         (4.0 * FINDER_MARKER_CELLS);
 
-    origin_x =
-        ((markers[0].x + markers[0].width) + (markers[2].x + markers[2].width)) * 0.5;
-    origin_y =
-        ((markers[0].y + markers[0].height) + (markers[1].y + markers[1].height)) * 0.5;
+    origin_x = (markers[0].x + markers[2].x) * 0.5;
+    origin_y = (markers[0].y + markers[1].y) * 0.5;
 
-    const double right_marker_left = (markers[1].x + markers[3].x) * 0.5;
-    const double bottom_marker_top = (markers[2].y + markers[3].y) * 0.5;
+    const double right_edge =
+        ((markers[1].x + markers[1].width) + (markers[3].x + markers[3].width)) * 0.5;
+    const double bottom_edge =
+        ((markers[2].y + markers[2].height) + (markers[3].y + markers[3].height)) * 0.5;
+    const double total_w = right_edge - origin_x;
+    const double total_h = bottom_edge - origin_y;
+    if (total_w <= 1.0 || total_h <= 1.0) {
+        return false;
+    }
 
-    cell_w = (right_marker_left - origin_x) / std::max(1, cfg.cells_per_row);
+    const int total_cols = layout_total_cols(cfg);
+    cell_w = total_w / std::max(1, total_cols);
     if (cell_w <= 1.0) {
         cell_w = marker_cell_w;
     }
 
-    const double row_span = bottom_marker_top - origin_y;
-    if (row_span <= 1.0) {
-        return false;
-    }
-
-    rows = static_cast<int>(std::round(row_span / std::max(1.0, marker_cell_h)));
-    rows = std::max(1, rows);
-    cell_h = row_span / rows;
+    const double marker_cell = (marker_cell_w + marker_cell_h) * 0.5;
+    rows = static_cast<int>(std::round(total_h / std::max(1.0, marker_cell)));
+    rows = std::max(2 * FINDER_MARKER_CELLS + 2, rows);
+    cell_h = total_h / rows;
     if (cell_h <= 1.0) {
         cell_h = marker_cell_h;
     }
@@ -976,11 +1077,15 @@ bool rectify_frame_with_quad(
 EncoderConfig make_default_encoder_config(int fps) {
     EncoderConfig cfg;
     cfg.fps = fps;
-    cfg.cell_size = 10;
-    cfg.cells_per_row = 219;
-    cfg.payload_bytes_per_frame = 6100;
+    cfg.cell_size = 11;
+    cfg.cells_per_row = 208;
+    cfg.payload_bytes_per_frame = 5600;
     cfg.reference_block_size = 2;
     return cfg;
+}
+
+int required_total_rows_for_payload_cells(const EncoderConfig& cfg, int payload_cells) {
+    return minimum_total_rows_for_cells(payload_cells, cfg);
 }
 
 void render_frame(
@@ -998,13 +1103,13 @@ void render_frame(
     }
 
     const int total_cells = static_cast<int>(cells.size());
-    const int payload_rows = std::max(1, (total_cells + cfg.cells_per_row - 1) / cfg.cells_per_row);
-    const int rows = std::max(payload_rows, forced_rows);
+    const int total_rows =
+        std::max(minimum_total_rows_for_cells(total_cells, cfg), std::max(1, forced_rows));
+    const std::vector<LayoutCell> data_cells = build_data_cells(total_rows, cfg);
     const int marker_px = FINDER_MARKER_CELLS * cfg.cell_size;
-    const int data_w = cfg.cells_per_row * cfg.cell_size;
-    const int data_h = rows * cfg.cell_size;
-    const int img_w = data_w + marker_px * 2;
-    const int img_h = data_h + marker_px * 2;
+    const int total_cols = layout_total_cols(cfg);
+    const int img_w = total_cols * cfg.cell_size;
+    const int img_h = total_rows * cfg.cell_size;
 
     out.create(img_h, img_w, CV_8UC3);
     out.setTo(cfg.background_color);
@@ -1026,9 +1131,11 @@ void render_frame(
     };
 
     draw_finder(0, 0);
-    draw_finder(img_w - marker_px, 0);
-    draw_finder(0, img_h - marker_px);
-    draw_finder(img_w - marker_px, img_h - marker_px);
+    draw_finder((total_cols - FINDER_MARKER_CELLS) * cfg.cell_size, 0);
+    draw_finder(0, (total_rows - FINDER_MARKER_CELLS) * cfg.cell_size);
+    draw_finder(
+        (total_cols - FINDER_MARKER_CELLS) * cfg.cell_size,
+        (total_rows - FINDER_MARKER_CELLS) * cfg.cell_size);
 
     const int small_marker_px = 2 * cfg.cell_size;
     auto draw_small = [&](int x, int y) {
@@ -1046,25 +1153,20 @@ void render_frame(
     draw_small(0, (img_h - small_marker_px) / 2);
     draw_small(img_w - small_marker_px, (img_h - small_marker_px) / 2);
 
-    const int origin_x = marker_px;
-    const int origin_y = marker_px;
-    for (int index = 0; index < total_cells; ++index) {
-        const int row = index / cfg.cells_per_row;
-        const int col = index % cfg.cells_per_row;
+    for (int index = 0; index < total_cells && index < static_cast<int>(data_cells.size()); ++index) {
+        const LayoutCell slot = data_cells[static_cast<size_t>(index)];
         cv::rectangle(
             out,
-            cv::Rect(origin_x + col * cfg.cell_size, origin_y + row * cfg.cell_size, cfg.cell_size, cfg.cell_size),
+            cv::Rect(slot.col * cfg.cell_size, slot.row * cfg.cell_size, cfg.cell_size, cfg.cell_size),
             cfg.colors[cells[index]],
             cv::FILLED);
     }
 
     const int ref_px = cfg.reference_block_size * cfg.cell_size;
-    int ref_y = origin_y - ref_px - cfg.cell_size;
-    if (ref_y < cfg.cell_size) {
-        ref_y = origin_y;
-    }
+    const int ref_y = layout_ref_top_row() * cfg.cell_size;
+    const int ref_x0 = layout_ref_left_col() * cfg.cell_size;
     for (int k = 0; k < 4; ++k) {
-        const int ref_x = origin_x + k * (ref_px + cfg.cell_size / 2);
+        const int ref_x = ref_x0 + k * ((cfg.reference_block_size + 1) * cfg.cell_size);
         cv::rectangle(out, cv::Rect(ref_x, ref_y, ref_px, ref_px), cfg.colors[k], cv::FILLED);
     }
 }
@@ -1074,8 +1176,12 @@ bool rectify_frame_geometry(const cv::Mat& frame, cv::Mat& out_rectified, const 
         return false;
     }
 
+    int expected_w = 0;
+    int expected_h = 0;
+    expected_canvas_size(cfg, expected_w, expected_h);
     const bool exact_raw_layout =
-        frame.cols == (cfg.cells_per_row + 2 * FINDER_MARKER_CELLS) * cfg.cell_size &&
+        frame.cols == expected_w &&
+        frame.rows == expected_h &&
         has_raw_layout_corners(frame, cfg);
     if (exact_raw_layout) {
         out_rectified = frame.clone();
@@ -1095,8 +1201,12 @@ bool rectify_frame_geometry(const cv::Mat& frame, cv::Mat& out_rectified, const 
 }
 
 bool sample_frame(const cv::Mat& frame, std::vector<uint8_t>& out_payload, EncoderConfig& cfg) {
+    int expected_w = 0;
+    int expected_h = 0;
+    expected_canvas_size(cfg, expected_w, expected_h);
     const bool exact_raw_layout =
-        frame.cols == (cfg.cells_per_row + 2 * FINDER_MARKER_CELLS) * cfg.cell_size &&
+        frame.cols == expected_w &&
+        frame.rows == expected_h &&
         has_raw_layout_corners(frame, cfg);
 
     auto sample_aligned = [&](const cv::Mat& aligned, const char* label) -> bool {
@@ -1108,24 +1218,23 @@ bool sample_frame(const cv::Mat& frame, std::vector<uint8_t>& out_payload, Encod
         double origin_y = 0.0;
         double cell_w = cfg.cell_size;
         double cell_h = cfg.cell_size;
-        int rows = 0;
+        int total_rows = 0;
         const bool marker_layout =
             (mode == "cropped" || mode == "warped") &&
-            derive_grid_from_markers(aligned, cfg, origin_x, origin_y, cell_w, cell_h, rows);
+            derive_grid_from_markers(aligned, cfg, origin_x, origin_y, cell_w, cell_h, total_rows);
 
         if (marker_layout) {
             // Use geometry inferred from the four large finder blocks when available.
         } else if (mode == "warped") {
-            cell_w = static_cast<double>(img_w) / (cfg.cells_per_row + FINDER_MARKER_CELLS);
+            cell_w = static_cast<double>(img_w) / std::max(1, layout_total_cols(cfg));
             cell_h = cell_w;
-            origin_x = (FINDER_MARKER_CELLS / 2.0) * cell_w;
-            origin_y = (FINDER_MARKER_CELLS / 2.0) * cell_h;
-            rows = static_cast<int>(std::round(img_h / cell_h)) - FINDER_MARKER_CELLS;
-        } else if ((mode == "raw" || mode == "aligned") &&
-                   img_w == (cfg.cells_per_row + 2 * FINDER_MARKER_CELLS) * cfg.cell_size) {
-            origin_x = static_cast<double>(FINDER_MARKER_CELLS * cfg.cell_size);
-            origin_y = static_cast<double>(FINDER_MARKER_CELLS * cfg.cell_size);
-            rows = (img_h - 2 * FINDER_MARKER_CELLS * cfg.cell_size) / cfg.cell_size;
+            origin_x = 0.0;
+            origin_y = 0.0;
+            total_rows = static_cast<int>(std::round(img_h / std::max(1.0, cell_h)));
+        } else if ((mode == "raw" || mode == "aligned") && img_w == expected_w && img_h == expected_h) {
+            origin_x = 0.0;
+            origin_y = 0.0;
+            total_rows = img_h / cfg.cell_size;
         } else {
             cv::Mat gray;
             if (aligned.channels() == 3) {
@@ -1178,14 +1287,14 @@ bool sample_frame(const cv::Mat& frame, std::vector<uint8_t>& out_payload, Encod
 
             origin_x = static_cast<double>(std::max(0, col_lo - (col_lo % cfg.cell_size)));
             origin_y = static_cast<double>(std::max(0, row_lo - (row_lo % cfg.cell_size)));
-            const int data_w = cfg.cells_per_row * cfg.cell_size;
+            const int data_w = img_w;
             if (origin_x + data_w > img_w) {
                 origin_x = static_cast<double>(std::max(0, img_w - data_w));
             }
-            rows = (row_hi - static_cast<int>(origin_y) + 1) / cfg.cell_size;
+            total_rows = std::max(2 * FINDER_MARKER_CELLS + 2, (row_hi - static_cast<int>(origin_y) + 1) / cfg.cell_size);
         }
 
-        if (rows <= 0) {
+        if (total_rows <= 0) {
             return false;
         }
 
@@ -1197,16 +1306,17 @@ bool sample_frame(const cv::Mat& frame, std::vector<uint8_t>& out_payload, Encod
         };
 
         const double ref_cells = static_cast<double>(cfg.reference_block_size);
-        const double ref_gap = std::max(1.0, cell_w * 0.5);
         const double ref_w = std::max(1.0, ref_cells * cell_w);
         const double ref_h = std::max(1.0, ref_cells * cell_h);
-        const double ref_y = origin_y - ref_h - cell_h;
+        const double ref_gap = cell_w;
+        const double ref_y = origin_y + layout_ref_top_row() * cell_h;
+        const double ref_x0 = origin_x + layout_ref_left_col() * cell_w;
         if (ref_y >= 0.0) {
             std::array<cv::Scalar, 4> observed_refs{};
             bool refs_ok = true;
 
             for (int k = 0; k < 4; ++k) {
-                const double ref_x = origin_x + k * (ref_w + ref_gap);
+                const double ref_x = ref_x0 + k * (ref_w + ref_gap);
                 const int x0 = static_cast<int>(std::round(ref_x));
                 const int y0 = static_cast<int>(std::round(ref_y));
                 const int rw = static_cast<int>(std::round(ref_w));
@@ -1230,11 +1340,12 @@ bool sample_frame(const cv::Mat& frame, std::vector<uint8_t>& out_payload, Encod
             }
         }
 
-        auto build_payload_candidates = [&](double ox, double oy, double cw, double ch, int rows_local) {
+        auto build_payload_candidates = [&](double ox, double oy, double cw, double ch, int total_rows_local) {
+            const std::vector<LayoutCell> sample_cells = build_data_cells(total_rows_local, cfg);
             std::vector<int> cells_local_chroma;
             std::vector<int> cells_local_missing;
-            cells_local_chroma.reserve(rows_local * cfg.cells_per_row);
-            cells_local_missing.reserve(rows_local * cfg.cells_per_row);
+            cells_local_chroma.reserve(sample_cells.size());
+            cells_local_missing.reserve(sample_cells.size());
 
             const cv::Vec3d black_ref(
                 classifier_colors[0][0],
@@ -1266,10 +1377,9 @@ bool sample_frame(const cv::Mat& frame, std::vector<uint8_t>& out_payload, Encod
             }
             const double black_threshold = std::max(18.0, min_color_energy * 0.20);
 
-            for (int row = 0; row < rows_local; ++row) {
-                for (int col = 0; col < cfg.cells_per_row; ++col) {
-                    const int x = static_cast<int>(std::round(ox + col * cw));
-                    const int y = static_cast<int>(std::round(oy + row * ch));
+            for (const LayoutCell& slot : sample_cells) {
+                    const int x = static_cast<int>(std::round(ox + slot.col * cw));
+                    const int y = static_cast<int>(std::round(oy + slot.row * ch));
                     const int cell_px_w = static_cast<int>(std::round(cw));
                     const int cell_px_h = static_cast<int>(std::round(ch));
                     if (x < 0 || y < 0 || x + cell_px_w > img_w || y + cell_px_h > img_h) {
@@ -1322,7 +1432,6 @@ bool sample_frame(const cv::Mat& frame, std::vector<uint8_t>& out_payload, Encod
                     }
                     cells_local_chroma.push_back(chroma_symbol);
                     cells_local_missing.push_back(missing_symbol);
-                }
             }
 
             std::vector<std::vector<uint8_t>> payloads;
@@ -1431,8 +1540,8 @@ bool sample_frame(const cv::Mat& frame, std::vector<uint8_t>& out_payload, Encod
         bool best_crc_match = false;
         std::vector<uint8_t> best_payload;
         for (const auto& variant : variants) {
-            const int trial_rows = rows + variant.row_delta;
-            if (trial_rows <= 0) {
+            const int trial_rows = total_rows + variant.row_delta;
+            if (trial_rows <= 2 * FINDER_MARKER_CELLS + 1) {
                 continue;
             }
 

@@ -200,10 +200,10 @@ decode <input.mp4> <output.bin> <validity.bin> <reference.bin>
 ## 当前默认参数
 
 - `fps = 20`
-- `cell_size = 10`
-- `cells_per_row = 219`
+- `cell_size = 11`
+- `cells_per_row = 208`
 - `reference_block_size = 2`
-- `payload_bytes_per_frame = 6100`
+- `payload_bytes_per_frame = 5600`
 
 ## 主要源码
 
