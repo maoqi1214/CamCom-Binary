@@ -1077,9 +1077,9 @@ bool rectify_frame_with_quad(
 EncoderConfig make_default_encoder_config(int fps) {
     EncoderConfig cfg;
     cfg.fps = fps;
-    cfg.cell_size = 11;
-    cfg.cells_per_row = 208;
-    cfg.payload_bytes_per_frame = 5600;
+    cfg.cell_size = 15;     //后续好像跟这个cellsize没什么关系？？莫名其妙的函数算出来它的值后直接使用而不是根据这里的输入
+    cfg.cells_per_row = 196;
+    cfg.payload_bytes_per_frame = 6000;
     cfg.reference_block_size = 2;
     return cfg;
 }
